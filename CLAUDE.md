@@ -103,7 +103,7 @@ cd lyra-control && npm run dev
 | Service | URL/Config |
 |---|---|
 | Jira | mbakers.atlassian.net (project: LYRA) |
-| GitHub | github.com/michaelbaker-dev |
+| GitHub | github.com/michaelbaker-dev/lyrasoftware |
 | OpenRouter | openrouter.ai (API key in settings) |
 | Claude Max | Max subscription (~900 msgs / 5hr window) |
 | OpenClaw | Local instance with Lyra identity |
