@@ -8,6 +8,7 @@ import {
   type AppStoppedEvent,
   type FailureAnalyzedEvent,
   type LaunchProgressEvent,
+  type AgentOutputEvent,
 } from "@/lib/lyra-events";
 
 export async function GET() {
@@ -62,6 +63,14 @@ export async function GET() {
       // Client disconnected
     }
   };
+  const agentOutputHandler = (data: AgentOutputEvent) => {
+    try {
+      send("agent:output", data);
+    } catch {
+      // Client disconnected
+    }
+  };
+  lyraEvents.on("agent:output", agentOutputHandler);
   lyraEvents.on("app:output", appOutputHandler);
   lyraEvents.on("app:launched", appLaunchedHandler);
   lyraEvents.on("app:stopped", appStoppedHandler);
@@ -76,6 +85,7 @@ export async function GET() {
     } catch {
       clearInterval(interval);
       lyraEvents.off("cost:update", costHandler);
+      lyraEvents.off("agent:output", agentOutputHandler);
       lyraEvents.off("app:output", appOutputHandler);
       lyraEvents.off("app:launched", appLaunchedHandler);
       lyraEvents.off("app:stopped", appStoppedHandler);
@@ -89,10 +99,12 @@ export async function GET() {
   const cleanup = setTimeout(() => {
     clearInterval(interval);
     lyraEvents.off("cost:update", costHandler);
+    lyraEvents.off("agent:output", agentOutputHandler);
     lyraEvents.off("app:output", appOutputHandler);
     lyraEvents.off("app:launched", appLaunchedHandler);
     lyraEvents.off("app:stopped", appStoppedHandler);
     lyraEvents.off("failure:analyzed", failureHandler);
+    lyraEvents.off("launch:progress", launchProgressHandler);
     close();
   }, 30 * 60 * 1000); // 30 min max connection
 

@@ -31,12 +31,26 @@ type SprintDemoProps = {
 };
 
 type AppOutputEvent = { projectId: string; line: string };
+type TriageResult = {
+  category: string;
+  action: string;
+  summary: string;
+  suggestedFix: string;
+  linkedBugKey?: string;
+};
+
 type LaunchProgressEvent = {
   projectId: string;
-  step: "analyzing" | "generating" | "validating" | "fixing" | "success" | "failed";
+  step: "analyzing" | "generating" | "validating" | "fixing" | "triaging" | "success" | "failed";
   attempt?: number;
   maxRetries?: number;
   error?: string;
+  triageInfo?: {
+    category: string;
+    summary: string;
+    suggestedFix: string;
+    linkedBugKey?: string;
+  };
 };
 
 export default function SprintDemo({ data, projectId, sprintId, onClose }: SprintDemoProps) {
@@ -57,6 +71,7 @@ export default function SprintDemo({ data, projectId, sprintId, onClose }: Sprin
   const [launchErrors, setLaunchErrors] = useState<string[]>([]);
   const [showLaunchErrors, setShowLaunchErrors] = useState(false);
   const [validationResult, setValidationResult] = useState<{ validated: boolean; attempts: number } | null>(null);
+  const [triageResult, setTriageResult] = useState<TriageResult | null>(null);
 
   // Release notes state
   const [releaseNotes, setReleaseNotes] = useState<{ markdown: string; filePath: string } | null>(null);
@@ -136,11 +151,14 @@ export default function SprintDemo({ data, projectId, sprintId, onClose }: Sprin
     setLaunchProgress(null);
     setLaunchErrors([]);
     setValidationResult(null);
+    setTriageResult(null);
     try {
       const result = await callAction("generate-launch", { maxRetries });
       setScriptPath(result.scriptPath);
       setValidationResult({ validated: result.validated, attempts: result.attempts });
-      if (!result.validated && result.lastError) {
+      if (result.triaged && result.triageResult) {
+        setTriageResult(result.triageResult);
+      } else if (!result.validated && result.lastError) {
         setScriptError(`Validation failed after ${result.attempts} attempts: ${result.lastError}`);
       }
     } catch (e) {
@@ -195,6 +213,7 @@ export default function SprintDemo({ data, projectId, sprintId, onClose }: Sprin
       case "generating": return "Generating launch config...";
       case "validating": return `Validating (${launchProgress.attempt}/${launchProgress.maxRetries})...`;
       case "fixing": return `Fixing errors (${launchProgress.attempt}/${launchProgress.maxRetries})...`;
+      case "triaging": return "Error requires project fix \u2014 creating bug ticket...";
       case "success": return "Validated!";
       case "failed": return "Validation failed";
       default: return "Processing...";
@@ -343,6 +362,28 @@ export default function SprintDemo({ data, projectId, sprintId, onClose }: Sprin
               <div key={i}>{o.line}</div>
             ))}
           </pre>
+        )}
+
+        {/* Triage result banner */}
+        {triageResult && (
+          <div className="mt-3 rounded-lg border border-yellow-700/50 bg-yellow-900/20 p-3 space-y-1">
+            <div className="text-sm font-medium text-yellow-300">Project Fix Required</div>
+            <div className="text-xs text-yellow-200/80">
+              <span className="font-medium">Category:</span> {triageResult.category}
+            </div>
+            <div className="text-xs text-yellow-200/80">
+              <span className="font-medium">Issue:</span> {triageResult.summary}
+            </div>
+            <div className="text-xs text-yellow-200/80">
+              <span className="font-medium">Suggested Fix:</span> {triageResult.suggestedFix}
+            </div>
+            {triageResult.linkedBugKey && (
+              <div className="text-xs text-yellow-200/80">
+                <span className="font-medium">Bug Ticket:</span>{" "}
+                <span className="font-mono text-yellow-300">{triageResult.linkedBugKey}</span>
+              </div>
+            )}
+          </div>
         )}
 
         {/* Launch validation errors */}

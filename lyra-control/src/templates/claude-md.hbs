@@ -1,0 +1,95 @@
+# {{projectName}}
+
+## Project
+- Jira: {{jiraKey}} at mbakers.atlassian.net
+- GitHub: michaelbaker-dev/{{githubRepo}}
+- Tech Stack: {{techStack}}
+
+## Conventions
+- Commit format: `{{commitPrefix}}({{jiraKey}}-NNN): description`
+- Branch naming: `feat/{{jiraKey}}-NNN-description`, `fix/{{jiraKey}}-NNN-description`
+- Always include Jira ticket ID in commit messages
+- Write tests for new functionality
+
+{{#if codebaseAnalysis}}
+## Tech Stack (Detected)
+- Framework: {{codebaseAnalysis.framework}}
+- Language: {{codebaseAnalysis.language}}
+- Package Manager: {{codebaseAnalysis.packageManager}}
+- Key Dependencies: {{#each codebaseAnalysis.keyDependencies}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}
+{{#if codebaseAnalysis.testFramework}}
+- Test Framework: {{codebaseAnalysis.testFramework}}
+{{#if codebaseAnalysis.testPattern}}- Test Pattern: `{{codebaseAnalysis.testPattern}}`{{/if}}
+{{/if}}
+
+## Commands (from package.json)
+{{#each codebaseAnalysis.scripts}}
+- `{{@key}}`: `{{this}}`
+{{/each}}
+
+## Project Structure
+```
+{{codebaseAnalysis.directoryOverview}}
+```
+
+{{#if codebaseAnalysis.entryPoints}}
+## Entry Points
+{{#each codebaseAnalysis.entryPoints}}
+- `{{this}}`
+{{/each}}
+{{/if}}
+{{else}}
+## Commands
+{{#each commands}}
+- {{this.name}}: `{{this.command}}`
+{{/each}}
+{{/if}}
+
+## Architecture
+{{#if description}}
+{{description}}
+{{/if}}
+
+{{#if isComplex}}
+## Branching Strategy
+- **Base branch**: `develop` — all feature/fix PRs target `develop`
+- **Production branch**: `main` — only tested code from `develop` is promoted to `main`
+- NEVER push directly to `main` or `develop` — always create a PR
+- Each agent works in its own git worktree — no shared working directories
+- Merge conflicts are resolved at PR time through GitHub
+
+## Environments
+| Environment | Port | Branch |
+|-------------|------|--------|
+{{#each environments}}
+| {{this.name}} | {{this.port}} | {{this.branch}} |
+{{/each}}
+{{/if}}
+
+## Definition of Done
+
+### Story Level
+- All acceptance criteria from the ticket are met
+- Tests written and passing for new functionality
+- Code compiles with no type errors (tsc --noEmit passes)
+- Commit messages follow conventional commit format with ticket ID
+- PR created with description linking to the Jira ticket
+- If acceptance criteria are already met, report this — do not make unnecessary changes
+
+### Epic Level
+- All child stories complete
+- Integration tests pass across story boundaries
+- No regressions in existing test suite
+
+### Feature Level
+- All child epics complete
+- End-to-end tests pass
+- Documentation updated if applicable
+
+## Working Conventions
+- Read existing code before making changes
+- Run tests before committing
+- Keep changes focused on the ticket scope
+- Use conventional commits (feat:, fix:, chore:, docs:)
+- Do NOT commit `claude-progress.txt` — it is a session scratchpad and must stay in `.gitignore`
+- If acceptance criteria are already met by existing code, state this clearly in your output — the system will verify and close the ticket without a PR

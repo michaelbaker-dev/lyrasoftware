@@ -1,0 +1,28 @@
+name: Post-Merge Smoke Test & Rollback
+on:
+  push:
+    branches: [main]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: {{nodeVersion}}
+      - run: npm ci
+      - run: npm run test:smoke
+
+  rollback:
+    needs: smoke-test
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Revert last merge
+        run: |
+          git revert HEAD --no-edit
+          git push origin main

@@ -14,6 +14,8 @@ import { promisify } from "util";
 import Handlebars from "handlebars";
 import { prisma } from "./db";
 import { lyraEvents } from "./lyra-events";
+import { upsertTriageLog } from "./failure-analyzer";
+import { createIssue, getBoardsForProject, getSprints, moveIssuesToSprint } from "./jira";
 import type { CodebaseAnalysis } from "./codebase-analyzer";
 
 const execAsync = promisify(execFile);
@@ -39,12 +41,31 @@ export interface ValidationResult {
   error?: string;
 }
 
+export type LaunchErrorClass = "config_fixable" | "project_fixable";
+
+export interface LaunchErrorClassification {
+  errorClass: LaunchErrorClass;
+  category: string;
+  summary: string;
+  suggestedFix: string;
+}
+
+export interface TriageResult {
+  category: string;
+  action: string;
+  summary: string;
+  suggestedFix: string;
+  linkedBugKey?: string;
+}
+
 export interface GenerateAndValidateResult {
   scriptPath: string;
   config: LaunchConfig;
   attempts: number;
   validated: boolean;
   lastError?: string;
+  triaged?: boolean;
+  triageResult?: TriageResult;
 }
 
 // ── Model Selection ─────────────────────────────────────────────────
@@ -347,6 +368,172 @@ export async function generateLaunchScript(
   return { scriptPath, config };
 }
 
+// ── Error Classification ──────────────────────────────────────────────
+
+const PROJECT_FIXABLE_PATTERNS: {
+  pattern: RegExp;
+  category: string;
+  summary: (match: RegExpMatchArray, error: string) => string;
+  suggestedFix: (match: RegExpMatchArray, error: string) => string;
+}[] = [
+  {
+    pattern: /node-gyp rebuild[\s\S]*(?:error C\d+|fatal error|c\+\+|g\+\+|clang)/i,
+    category: "dependency_issue",
+    summary: (_m, error) => {
+      const pkg = error.match(/(\S+)@[\d.]+/)?.[1] || "native module";
+      return `Native module "${pkg}" failed to compile`;
+    },
+    suggestedFix: (_m, error) => {
+      const pkg = error.match(/(\S+)@[\d.]+/)?.[1];
+      return pkg
+        ? `Update "${pkg}" to a version with prebuilt binaries for your Node version: npm install ${pkg}@latest`
+        : "Update the native dependency to a version compatible with your Node version";
+    },
+  },
+  {
+    pattern: /prebuild-install[\s\S]*(?:no prebuilt|not found|unsupported)/i,
+    category: "dependency_issue",
+    summary: (_m, error) => {
+      const pkg = error.match(/(\S+)@[\d.]+/)?.[1] || "native module";
+      return `No prebuilt binaries available for "${pkg}"`;
+    },
+    suggestedFix: (_m, error) => {
+      const pkg = error.match(/(\S+)@[\d.]+/)?.[1];
+      return pkg
+        ? `Update "${pkg}" to a version with prebuilt binaries: npm install ${pkg}@latest`
+        : "Update the native dependency to a newer version with prebuilt binaries";
+    },
+  },
+  {
+    pattern: /ERESOLVE[\s\S]*(?:peer dep|could not resolve|conflicting)/i,
+    category: "dependency_issue",
+    summary: () => "Peer dependency conflict prevents installation",
+    suggestedFix: (_m, error) => {
+      const conflict = error.match(/(?:peer dep|requires).*?(\S+@\S+)/i)?.[1];
+      return conflict
+        ? `Resolve peer dependency conflict involving ${conflict}. Run: npm ls --all to identify conflicting versions, then update package.json accordingly`
+        : "Resolve peer dependency conflicts in package.json. Run: npm ls --all to identify conflicting versions";
+    },
+  },
+  {
+    pattern: /engines?[\s\S]*node[\s\S]*(?:not compatible|does not satisfy|unsupported)/i,
+    category: "dependency_issue",
+    summary: () => "Node.js engine version mismatch",
+    suggestedFix: (_m, error) => {
+      const required = error.match(/engines?.*"node":\s*"([^"]+)"/)?.[1];
+      return required
+        ? `Update the "engines.node" field in package.json to include the current Node version, or install a compatible Node version (required: ${required})`
+        : 'Update the "engines.node" field in package.json to be compatible with the current Node version';
+    },
+  },
+  {
+    pattern: /\.h:\s*No such file|fatal error:[\s\S]*\.h[\s\S]*not found|Cannot find[\s\S]*header/i,
+    category: "env_issue",
+    summary: (_m, error) => {
+      const header = error.match(/([\w./]+\.h)/)?.[1] || "system header";
+      return `Missing system header file: ${header}`;
+    },
+    suggestedFix: (_m, error) => {
+      const header = error.match(/([\w./]+\.h)/)?.[1];
+      return header
+        ? `Install the system development package that provides "${header}". On macOS: xcode-select --install. On Ubuntu: apt-get install build-essential`
+        : "Install required system development libraries. On macOS: xcode-select --install. On Ubuntu: apt-get install build-essential";
+    },
+  },
+];
+
+/**
+ * Classify a validation error as config-fixable or project-fixable.
+ * Returns null if no pattern matches (assumed config-fixable).
+ */
+export function classifyLaunchError(error: string): LaunchErrorClassification | null {
+  for (const { pattern, category, summary, suggestedFix } of PROJECT_FIXABLE_PATTERNS) {
+    const match = error.match(pattern);
+    if (match) {
+      return {
+        errorClass: "project_fixable",
+        category,
+        summary: summary(match, error),
+        suggestedFix: suggestedFix(match, error),
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Create a Jira Bug ticket for a project-fixable launch error and log to TriageLog.
+ */
+async function triageLaunchFailure(
+  projectId: string,
+  projectPath: string,
+  classification: LaunchErrorClassification,
+  errorOutput: string,
+): Promise<TriageResult> {
+  const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
+  const jiraKey = project.jiraKey;
+
+  // Create Jira Bug
+  const bugSummary = `[Launch Validation] ${classification.summary}`;
+  const bugDescription = [
+    `Category: ${classification.category}`,
+    `Suggested Fix: ${classification.suggestedFix}`,
+    `Project Path: ${projectPath}`,
+    "",
+    "--- Error Output (last 3000 chars) ---",
+    errorOutput.slice(-3000),
+  ].join("\n");
+
+  let linkedBugKey: string | undefined;
+  try {
+    const issue = await createIssue(jiraKey, "Bug", bugSummary, bugDescription);
+    linkedBugKey = issue?.key;
+
+    // Move to active sprint if one exists
+    if (linkedBugKey && project.jiraBoardId) {
+      try {
+        const sprintsResult = await getSprints(project.jiraBoardId, "active");
+        const activeSprint = sprintsResult?.values?.[0];
+        if (activeSprint) {
+          await moveIssuesToSprint(activeSprint.id, [linkedBugKey]);
+        }
+      } catch {
+        // Non-critical: sprint move failed
+      }
+    }
+  } catch (e) {
+    console.error("[triageLaunchFailure] Failed to create Jira bug:", (e as Error).message);
+  }
+
+  // Persist TriageLog entry (deduped)
+  const action = "create_bug";
+  await upsertTriageLog({
+    projectId,
+    ticketKey: linkedBugKey || "UNKNOWN",
+    ticketSummary: classification.summary,
+    source: "launch_validation",
+    category: classification.category,
+    action,
+    summary: classification.summary,
+    suggestedFix: classification.suggestedFix,
+    actionTaken: linkedBugKey
+      ? `Created bug ticket ${linkedBugKey}`
+      : "Failed to create bug ticket",
+    linkedBugKey,
+    confidence: 1.0,
+    resolution: "open",
+    attemptCount: 1,
+  });
+
+  return {
+    category: classification.category,
+    action,
+    summary: classification.summary,
+    suggestedFix: classification.suggestedFix,
+    linkedBugKey,
+  };
+}
+
 // ── Self-Healing Pipeline ─────────────────────────────────────────────
 
 export async function generateAndValidateLaunchScript(
@@ -417,6 +604,55 @@ export async function generateAndValidateLaunchScript(
 
     lastError = result.error;
     lastFailedStep = result.failedStep;
+
+    // Classify the error after first failure — short-circuit if project-fixable
+    if (attempt === 1 && lastError) {
+      const classification = classifyLaunchError(lastError);
+      if (classification) {
+        lyraEvents.emit("launch:progress", {
+          projectId,
+          step: "triaging",
+          attempt,
+          maxRetries,
+          triageInfo: {
+            category: classification.category,
+            summary: classification.summary,
+            suggestedFix: classification.suggestedFix,
+          },
+        });
+
+        const triageResult = await triageLaunchFailure(
+          projectId,
+          projectPath,
+          classification,
+          lastError,
+        );
+
+        lyraEvents.emit("launch:progress", {
+          projectId,
+          step: "failed",
+          attempt,
+          maxRetries,
+          error: lastError,
+          triageInfo: {
+            category: triageResult.category,
+            summary: triageResult.summary,
+            suggestedFix: triageResult.suggestedFix,
+            linkedBugKey: triageResult.linkedBugKey,
+          },
+        });
+
+        return {
+          scriptPath,
+          config,
+          attempts: attempt,
+          validated: false,
+          lastError,
+          triaged: true,
+          triageResult,
+        };
+      }
+    }
   }
 
   // All retries exhausted

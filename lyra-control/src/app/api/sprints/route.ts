@@ -1,17 +1,12 @@
 import { prisma } from "@/lib/db";
-import { planSprint, startSprint, completeSprint, updateSprintProgress } from "@/lib/sprint-planner";
-import { resolveGitHubToken } from "@/lib/github";
+import { planSprint, startSprint, completeSprint, updateSprintProgress, analyzeTeamGaps } from "@/lib/sprint-planner";
 import { gatherDemoData } from "@/lib/sprint-demo-data";
 import { generateLaunchScript, generateAndValidateLaunchScript } from "@/lib/launch-generator";
 import { launchApp, stopApp, getAppStatus } from "@/lib/process-manager";
 import { generateReleaseNotes } from "@/lib/release-notes-generator";
 import { lyraEvents } from "@/lib/lyra-events";
 import { analyzeCodebase, type CodebaseAnalysis, type AnalysisMode } from "@/lib/codebase-analyzer";
-import { execFile } from "child_process";
-import { promisify } from "util";
 import { NextRequest } from "next/server";
-
-const exec = promisify(execFile);
 
 // In-memory cache for launch analysis (avoids DB column, TTL = 10 min)
 const launchAnalysisCache = new Map<string, { analysis: CodebaseAnalysis; expiresAt: number }>();
@@ -90,7 +85,8 @@ export async function POST(request: Request) {
           return Response.json({ error: "projectId and sprintName are required" }, { status: 400 });
         }
         const result = await planSprint({ projectId, sprintName, goal, model });
-        return Response.json({ success: true, ...result });
+        const gaps = await analyzeTeamGaps(projectId, result.sprint.selectedKeys);
+        return Response.json({ success: true, ...result, gaps });
       }
 
       case "start": {
@@ -148,6 +144,8 @@ export async function POST(request: Request) {
           attempts: result.attempts,
           validated: result.validated,
           lastError: result.lastError,
+          triaged: result.triaged,
+          triageResult: result.triageResult,
         });
       }
 
@@ -225,35 +223,140 @@ export async function POST(request: Request) {
           return Response.json({ error: "projectId is required" }, { status: 400 });
         }
 
-        const project = await prisma.project.findUnique({ where: { id: projectId } });
-        if (!project?.githubRepo) {
-          return Response.json({ error: "Project has no GitHub repo" }, { status: 400 });
+        const { runMergeQueue } = await import("@/lib/merge-queue");
+        const mergeResult = await runMergeQueue(projectId);
+        return Response.json({ success: true, ...mergeResult });
+      }
+
+      case "resolve-conflicts": {
+        const { projectId, conflictPRs, ticketKeys } = body;
+        if (!projectId || (!Array.isArray(conflictPRs) && !Array.isArray(ticketKeys))) {
+          return Response.json(
+            { error: "projectId and conflictPRs[] or ticketKeys[] are required" },
+            { status: 400 }
+          );
         }
 
-        const token = await resolveGitHubToken(projectId);
-        const env = token ? { ...process.env, GH_TOKEN: token } : process.env;
-        const org = (await prisma.setting.findUnique({ where: { key: "github_org" } }))?.value || "michaelbaker-dev";
-        const repoSlug = `${org}/${project.githubRepo}`;
+        const project = await prisma.project.findUnique({
+          where: { id: projectId },
+          select: { id: true, githubRepo: true },
+        });
+        if (!project || !project.githubRepo) {
+          return Response.json({ error: "Project or repo not found" }, { status: 404 });
+        }
 
-        // List open PRs
-        const { stdout } = await exec("gh", [
-          "pr", "list", "--repo", repoSlug, "--state", "open",
-          "--json", "number", "--jq", ".[].number",
-        ], { env });
+        const { closePR } = await import("@/lib/github");
+        const { retryTicket } = await import("@/lib/dispatcher");
 
-        const prNumbers = stdout.trim().split("\n").filter(Boolean).map(Number).sort((a, b) => a - b);
-        const results: Array<{ pr: number; merged: boolean; error?: string }> = [];
+        const results: Array<{
+          pr: number | null;
+          ticketKey: string | null;
+          step: string;
+          success: boolean;
+          error?: string;
+          sessionId?: string;
+        }> = [];
 
-        for (const pr of prNumbers) {
-          try {
-            await exec("gh", ["pr", "merge", String(pr), "--repo", repoSlug, "--squash", "--admin"], { env });
-            results.push({ pr, merged: true });
-          } catch (e) {
-            results.push({ pr, merged: false, error: (e as Error).message });
+        // Mode 1: Direct ticket re-dispatch (recovery — PRs already closed)
+        if (Array.isArray(ticketKeys) && ticketKeys.length > 0) {
+          for (const ticketKey of ticketKeys as string[]) {
+            try {
+              const { sessionId } = await retryTicket(ticketKey, projectId);
+              results.push({
+                pr: null,
+                ticketKey,
+                step: "redispatched",
+                success: true,
+                sessionId,
+              });
+            } catch (e) {
+              results.push({
+                pr: null,
+                ticketKey,
+                step: "redispatch",
+                success: false,
+                error: (e as Error).message,
+              });
+            }
           }
         }
 
+        // Mode 2: Close PRs then re-dispatch (from merge conflict results)
+        if (Array.isArray(conflictPRs)) {
+          // Process sequentially so agents don't trample each other
+          for (const item of conflictPRs as Array<{ pr: number; ticketKey: string | null }>) {
+            // Step 1: Close the PR and delete the branch
+            const closeResult = await closePR(project.githubRepo, item.pr, true, projectId);
+            if (!closeResult.closed) {
+              results.push({
+                pr: item.pr,
+                ticketKey: item.ticketKey,
+                step: "close",
+                success: false,
+                error: closeResult.error,
+              });
+              continue;
+            }
+
+            // Step 2: Re-dispatch if we have a ticket key
+            if (item.ticketKey) {
+              try {
+                const { sessionId } = await retryTicket(item.ticketKey, projectId);
+                results.push({
+                  pr: item.pr,
+                  ticketKey: item.ticketKey,
+                  step: "redispatched",
+                  success: true,
+                  sessionId,
+                });
+              } catch (e) {
+                results.push({
+                  pr: item.pr,
+                  ticketKey: item.ticketKey,
+                  step: "redispatch",
+                  success: false,
+                  error: (e as Error).message,
+                });
+              }
+            } else {
+              results.push({
+                pr: item.pr,
+                ticketKey: null,
+                step: "closed-only",
+                success: true,
+              });
+            }
+          }
+        }
+
+        // Audit log for re-dispatch operations
+        await prisma.auditLog.create({
+          data: {
+            projectId,
+            actor: "lyra",
+            action: "resolve_conflicts.run",
+            details: JSON.stringify({
+              total: results.length,
+              succeeded: results.filter(r => r.success).length,
+              failed: results.filter(r => !r.success).length,
+            }),
+          },
+        });
+
         return Response.json({ success: true, results });
+      }
+
+      case "create-agent": {
+        const { projectId, role } = body;
+        if (!projectId || !role) {
+          return Response.json({ error: "projectId and role are required" }, { status: 400 });
+        }
+        const { createAgentForRole } = await import("@/app/projects/[id]/team-actions");
+        const agentResult = await createAgentForRole(projectId, role);
+        if (!agentResult.success) {
+          return Response.json({ error: agentResult.error }, { status: 400 });
+        }
+        return Response.json({ success: true, agentName: agentResult.agentName });
       }
 
       case "refresh": {

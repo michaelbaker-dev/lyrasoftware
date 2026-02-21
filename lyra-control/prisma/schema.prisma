@@ -1,0 +1,298 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id           String   @id @default(cuid())
+  name         String
+  path         String
+  jiraKey      String   @unique
+  githubRepo   String?
+  techStack    String?
+  description  String?
+  vision       String?
+  prdContent   String?
+  ardContent   String?
+  prdStatus    String   @default("pending")
+  ardStatus    String   @default("pending")
+  targetUsers  String?
+  constraints  String?
+  existingRepo    String?
+  onboardingStep  Int      @default(0)
+  aiCostTotal     Float    @default(0)
+  status          String   @default("active")
+  jiraBoardId     Int?
+  activeSprintId  Int?
+  sprintLength    Int      @default(14)
+  velocityTarget  Int      @default(20)
+  codebaseAnalysis  String?   // JSON blob of CodebaseAnalysis results
+  analysisStatus    String?   // "pending" | "analyzing" | "complete" | "failed"
+  githubToken       String?   // Per-project GitHub PAT (overrides default)
+  breakdownContent String?
+  breakdownStatus  String  @default("pending")
+  archProfile     String   @default("simple")  // "simple" | "complex"
+  baseBranch      String   @default("main")    // PR target: "main" or "develop"
+  environments    String?  // JSON: [{ name, port, branch }]
+  createdAt       DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  agents         Agent[]
+  sessions       Session[]
+  auditLogs      AuditLog[]
+  aiUsageLogs    AiUsageLog[]
+  sprints        Sprint[]
+  lyraMemories   LyraMemory[]
+  gateRuns       QualityGateRun[]
+  notifications  Notification[]
+  teams          Team[]
+  chatMessages   ChatMessage[]
+  slackThreads   SlackThread[]
+  triageLogs     TriageLog[]
+  webhookUrl           String?
+  slackChannelId       String?
+  emailThreadPrefix    String?
+}
+
+model Sprint {
+  id              String    @id @default(cuid())
+  projectId       String
+  jiraSprintId    Int       @unique
+  name            String
+  goal            String?
+  startDate       DateTime?
+  endDate         DateTime?
+  state           String    @default("future")
+  plannedPoints   Int       @default(0)
+  completedPoints Int       @default(0)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  project         Project   @relation(fields: [projectId], references: [id])
+}
+
+model Agent {
+  id           String   @id @default(cuid())
+  name         String
+  role         String   // architect, dev, qa
+  model        String?  // null = inherit from team
+  personality  String?  // system prompt modifier for agent personality
+  status       String   @default("idle") // idle, running, errored, rate-limited
+  projectId    String?
+  teamId       String?
+  currentTicket String?
+  startedAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  project   Project?  @relation(fields: [projectId], references: [id])
+  team      Team?     @relation("TeamAgents", fields: [teamId], references: [id])
+  sessions  Session[]
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  agentId      String
+  projectId    String
+  ticketKey    String
+  branch       String
+  worktreePath String
+  status       String   @default("running") // running, completed, failed, cancelled
+  tokensUsed   Int      @default(0)
+  cost         Float    @default(0)
+  startedAt    DateTime @default(now())
+  completedAt  DateTime?
+  output       String?  // JSON log
+  prompt       String?  // The full prompt sent to the agent
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  agent      Agent           @relation(fields: [agentId], references: [id])
+  project    Project         @relation(fields: [projectId], references: [id])
+  gateRuns   QualityGateRun[]
+  triageLogs TriageLog[]
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  projectId String?
+  action    String
+  actor     String
+  details   String   // JSON string
+  createdAt DateTime @default(now())
+
+  project   Project? @relation(fields: [projectId], references: [id])
+}
+
+model AiUsageLog {
+  id               String   @id @default(cuid())
+  projectId        String?
+  sessionId        String?  // link to agent session (for Claude Code runs)
+  agentId          String?  // which agent made the call
+  teamId           String?  // team context
+  document         String   // kept for backward compat: "prd" | "ard"
+  category         String   @default("general") // "agent_run" | "routing" | "ceremony" | "prd" | "ard" | "breakdown" | "decision" | "qa" | "chat" | "general"
+  provider         String   // "openrouter" | "lmstudio" | "anthropic"
+  requestedModel   String
+  actualModel      String
+  promptTokens     Int      @default(0)
+  completionTokens Int      @default(0)
+  totalTokens      Int      @default(0)
+  cost             Float    @default(0)   // USD, 0 for local
+  syntheticCost    Float    @default(0)   // what it WOULD have cost on cloud (for local models)
+  isLocal          Boolean  @default(false)
+  ticketKey        String?  // Jira ticket context
+  durationMs       Int      @default(0)   // wall-clock time
+  tokensPerSecond  Float    @default(0)   // completion_tokens / (durationMs/1000)
+  createdAt        DateTime @default(now())
+
+  project   Project? @relation(fields: [projectId], references: [id])
+}
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String   // JSON string
+  updatedAt DateTime @updatedAt
+}
+
+model LyraMemory {
+  id        String   @id @default(cuid())
+  projectId String?
+  category  String   // "decision" | "observation" | "reflection" | "escalation"
+  content   String   // JSON: { event, decision, reasoning, outcome }
+  createdAt DateTime @default(now())
+  project   Project? @relation(fields: [projectId], references: [id])
+}
+
+model QualityGateRun {
+  id        String   @id @default(cuid())
+  sessionId String
+  ticketKey String
+  projectId String
+  passed    Boolean
+  checks    String   // JSON array of { name, passed, details }
+  reasoning String   // Lyra's summary
+  createdAt DateTime @default(now())
+  session   Session  @relation(fields: [sessionId], references: [id])
+  project   Project  @relation(fields: [projectId], references: [id])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  projectId String?
+  channel   String   @default("in_app") // "in_app" | "email" | "webhook"
+  severity  String   @default("info")    // "info" | "warning" | "critical"
+  title     String
+  body      String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  project   Project? @relation(fields: [projectId], references: [id])
+}
+
+model MessageQueue {
+  id         String    @id @default(cuid())
+  channel    String    // "imessage" | "teams" | "email" | "webhook"
+  recipient  String    // phone, email, conversation ref, URL
+  subject    String?   // for email
+  body       String
+  status     String    @default("pending") // "pending" | "sent" | "failed"
+  retryCount Int       @default(0)
+  lastError  String?
+  createdAt  DateTime  @default(now())
+  sentAt     DateTime?
+}
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  projectId String?
+  role      String   // "user" | "assistant" | "system"
+  content   String
+  metadata  String?  // JSON: { type: "summary", summarizedCount, etc. }
+  createdAt DateTime @default(now())
+  project   Project? @relation(fields: [projectId], references: [id])
+}
+
+model SlackThread {
+  id        String   @id @default(cuid())
+  projectId String
+  type      String   // "standup" | "review" | "retro" | "ticket"
+  threadTs  String   // Slack thread timestamp (used as thread_ts for replies)
+  channelId String   // Slack channel where the thread lives
+  label     String?  // Human label: sprint name, ticket key, date
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id])
+}
+
+model Team {
+  id              String   @id @default(cuid())
+  projectId       String
+  name            String
+  type            String   @default("scrum")
+  maxAgents       Int      @default(4)
+  specialization  String   @default("general") // backend|frontend|infra|qa|triage|architecture|general
+  systemPrompt    String?  // rich team-level prompt for all agents on this team
+  model           String   @default("claude-sonnet-4-5") // default LLM for the team
+  routingLabels   String?  // JSON array of Jira labels/components that route here
+  routingPriority Int      @default(50) // lower = checked first during routing
+  isDefault       Boolean  @default(false) // fallback team for unrouted tickets
+  enabled         Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  project         Project  @relation(fields: [projectId], references: [id])
+  agents          Agent[]  @relation("TeamAgents")
+}
+
+model TriageLog {
+  id            String    @id @default(cuid())
+  projectId     String
+  ticketKey     String
+  ticketSummary String?
+  sessionId     String?
+  source        String    @default("agent_failure")  // agent_failure | slack_bug | oversight_escalation | oversight_context | launch_validation
+  category      String                                // build_error, test_failure, etc.
+  action        String                                // retry_same_team, create_bug, etc.
+  summary       String
+  suggestedFix  String
+  rootCause     String?
+  confidence    Float     @default(0.5)
+  reassignTo    String?
+  actionTaken   String
+  linkedBugKey  String?
+  resolution    String    @default("open")  // open | retrying | fixed | wontfix | escalated
+  attemptCount  Int       @default(1)
+  resolvedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  project       Project   @relation(fields: [projectId], references: [id])
+  session       Session?  @relation(fields: [sessionId], references: [id])
+
+  @@index([projectId, ticketKey, resolution])
+}
+
+model TeamTemplate {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String
+  config      String   // JSON: { teams: [{ name, specialization, model, systemPrompt, routingLabels, agents: [...] }] }
+  isBuiltIn   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+}
+
+model RoleConfig {
+  id        String   @id @default(cuid())
+  role      String   @unique        // "architect", "dev", "qa", "security", "docs"
+  label     String                  // "Architect", "Developer", "QA", etc.
+  phase     Int      @default(50)   // ordering: lower runs first (10=architect, 20=dev, 30=qa)
+  prompt    String?                 // role-specific system prompt for agents
+  color     String   @default("gray") // UI badge color
+  isBuiltIn Boolean  @default(false)  // true for core roles, prevents deletion
+  createdAt DateTime @default(now())
+}

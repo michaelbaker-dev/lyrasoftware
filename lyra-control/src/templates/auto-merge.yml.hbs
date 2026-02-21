@@ -1,0 +1,18 @@
+name: Auto-Merge
+on:
+  check_suite:
+    types: [completed]
+
+jobs:
+  auto-merge:
+    if: github.event.check_suite.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auto-merge passing PRs
+        run: |
+          gh pr list --state open --json number,title --jq '.[].number' | while read pr; do
+            gh pr merge "$pr" --auto --squash
+          done
+        env:
+          GH_TOKEN: ${{curlyOpen}}{{curlyOpen}} secrets.GITHUB_TOKEN {{curlyClose}}{{curlyClose}}

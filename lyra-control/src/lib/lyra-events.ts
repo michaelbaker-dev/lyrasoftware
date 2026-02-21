@@ -128,12 +128,46 @@ export interface AppOutputEvent {
   line: string;
 }
 
+export interface AgentOutputEvent {
+  ticketKey: string;
+  projectId: string;
+  sessionId: string;
+  line: string;
+  timestamp: string;
+}
+
+export interface TicketAbandonedEvent {
+  ticketKey: string;
+  projectId: string;
+  blockedTickets: string[];
+}
+
+export interface TicketAlreadyDoneEvent {
+  ticketKey: string;
+  projectId: string;
+  sessionId: string;
+  reasoning: string;
+}
+
 export interface LaunchProgressEvent {
   projectId: string;
-  step: "analyzing" | "generating" | "validating" | "fixing" | "success" | "failed";
+  step: "analyzing" | "generating" | "validating" | "fixing" | "triaging" | "success" | "failed";
   attempt?: number;
   maxRetries?: number;
   error?: string;
+  triageInfo?: {
+    category: string;
+    summary: string;
+    suggestedFix: string;
+    linkedBugKey?: string;
+  };
+}
+
+export interface MergeProgressEvent {
+  projectId: string;
+  pr: number;
+  ticketKey: string | null;
+  status: "merging" | "merged" | "conflict" | "error";
 }
 
 // ── Event map ───────────────────────────────────────────────────────
@@ -141,6 +175,7 @@ export interface LaunchProgressEvent {
 export interface LyraEventMap {
   "agent:completed": AgentCompletedEvent;
   "agent:failed": AgentFailedEvent;
+  "agent:output": AgentOutputEvent;
   "gate:passed": GateResultEvent;
   "gate:failed": GateResultEvent;
   "qa:assigned": QaAssignedEvent;
@@ -155,7 +190,11 @@ export interface LyraEventMap {
   "app:launched": AppLaunchedEvent;
   "app:stopped": AppStoppedEvent;
   "app:output": AppOutputEvent;
+  "ticket:abandoned": TicketAbandonedEvent;
+  "ticket:already-done": TicketAlreadyDoneEvent;
   "launch:progress": LaunchProgressEvent;
+  "merge:progress": MergeProgressEvent;
+  "merge:complete": MergeProgressEvent;
   notify: NotifyEvent;
 }
 
