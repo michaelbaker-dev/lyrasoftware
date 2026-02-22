@@ -9,6 +9,10 @@ import {
   type FailureAnalyzedEvent,
   type LaunchProgressEvent,
   type AgentOutputEvent,
+  type GateResultEvent,
+  type AgentCompletedEvent,
+  type AgentFailedEvent,
+  type TicketAbandonedEvent,
 } from "@/lib/lyra-events";
 
 export async function GET() {
@@ -70,12 +74,34 @@ export async function GET() {
       // Client disconnected
     }
   };
+  // Pipeline-related event handlers
+  const gatePassedHandler = (data: GateResultEvent) => {
+    try { send("gate:passed", data); } catch { /* disconnected */ }
+  };
+  const gateFailedHandler = (data: GateResultEvent) => {
+    try { send("gate:failed", data); } catch { /* disconnected */ }
+  };
+  const agentCompletedHandler = (data: AgentCompletedEvent) => {
+    try { send("agent:completed", data); } catch { /* disconnected */ }
+  };
+  const agentFailedHandler = (data: AgentFailedEvent) => {
+    try { send("agent:failed", data); } catch { /* disconnected */ }
+  };
+  const ticketAbandonedHandler = (data: TicketAbandonedEvent) => {
+    try { send("ticket:abandoned", data); } catch { /* disconnected */ }
+  };
+
   lyraEvents.on("agent:output", agentOutputHandler);
   lyraEvents.on("app:output", appOutputHandler);
   lyraEvents.on("app:launched", appLaunchedHandler);
   lyraEvents.on("app:stopped", appStoppedHandler);
   lyraEvents.on("failure:analyzed", failureHandler);
   lyraEvents.on("launch:progress", launchProgressHandler);
+  lyraEvents.on("gate:passed", gatePassedHandler);
+  lyraEvents.on("gate:failed", gateFailedHandler);
+  lyraEvents.on("agent:completed", agentCompletedHandler);
+  lyraEvents.on("agent:failed", agentFailedHandler);
+  lyraEvents.on("ticket:abandoned", ticketAbandonedHandler);
 
   // Poll for updates every 5 seconds
   const interval = setInterval(() => {
@@ -91,6 +117,11 @@ export async function GET() {
       lyraEvents.off("app:stopped", appStoppedHandler);
       lyraEvents.off("failure:analyzed", failureHandler);
       lyraEvents.off("launch:progress", launchProgressHandler);
+      lyraEvents.off("gate:passed", gatePassedHandler);
+      lyraEvents.off("gate:failed", gateFailedHandler);
+      lyraEvents.off("agent:completed", agentCompletedHandler);
+      lyraEvents.off("agent:failed", agentFailedHandler);
+      lyraEvents.off("ticket:abandoned", ticketAbandonedHandler);
       close();
     }
   }, 5000);
@@ -105,6 +136,11 @@ export async function GET() {
     lyraEvents.off("app:stopped", appStoppedHandler);
     lyraEvents.off("failure:analyzed", failureHandler);
     lyraEvents.off("launch:progress", launchProgressHandler);
+    lyraEvents.off("gate:passed", gatePassedHandler);
+    lyraEvents.off("gate:failed", gateFailedHandler);
+    lyraEvents.off("agent:completed", agentCompletedHandler);
+    lyraEvents.off("agent:failed", agentFailedHandler);
+    lyraEvents.off("ticket:abandoned", ticketAbandonedHandler);
     close();
   }, 30 * 60 * 1000); // 30 min max connection
 

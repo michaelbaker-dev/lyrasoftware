@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { addComment } from "@/lib/jira";
-import { transitionToStatus, triggerDispatch, getState as getDispatcherState } from "@/lib/dispatcher";
+import { transitionToStatus, triggerDispatch, getState as getDispatcherState, resetAbandonedTicket } from "@/lib/dispatcher";
 import { startScheduler } from "@/lib/scheduler";
 
 const VALID_RESOLUTIONS = ["open", "retrying", "fixed", "wontfix", "escalated"];
@@ -168,6 +168,9 @@ export async function POST(req: NextRequest) {
     await transitionToStatus(entry.ticketKey, "To Do").catch((e) =>
       console.error("[API/triage] Failed to transition ticket:", e)
     );
+
+    // Clear abandoned flag so dispatcher doesn't skip this ticket
+    resetAbandonedTicket(entry.ticketKey);
 
     // Reset failure counts so dispatcher doesn't skip due to maxRetries
     await prisma.session.updateMany({

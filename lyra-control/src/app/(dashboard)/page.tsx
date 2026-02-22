@@ -5,6 +5,7 @@ import CostTicker from "@/components/cost-ticker";
 import ActivityFeed from "@/components/activity-feed";
 import SystemHealth from "@/components/system-health";
 import ProjectSelector from "@/components/project-selector";
+import PipelineActivity from "@/components/pipeline-activity";
 
 export const dynamic = "force-dynamic";
 
@@ -111,6 +112,7 @@ export default async function DashboardPage({
         <div className="lg:col-span-2 space-y-6">
           <AgentStatusPanel />
           <WorkQueue tickets={tickets} />
+          <PipelineActivity />
         </div>
         <div className="space-y-6">
           <CostTicker projectId={projectId} />

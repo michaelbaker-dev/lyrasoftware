@@ -8,7 +8,8 @@ export const STORY_DOD = [
   "Tests written and passing for new functionality (skip if the story is pure scaffolding/config with no testable behavior)",
   "Code compiles with no type errors (tsc --noEmit passes)",
   "Commit messages follow conventional commit format with ticket ID",
-  "All created/modified files are git committed (run git status to verify nothing is uncommitted)",
+  "CRITICAL: Your work is evaluated ONLY by git diff. Before finishing you MUST run: 1) git add -A  2) git commit  3) git diff <baseBranch>..HEAD --stat — must show your changes. If this diff is empty, your session WILL BE REJECTED as a phantom completion.",
+  "Do NOT report completion without actual file changes visible in git diff — reasoning about code is not implementation",
   "If all acceptance criteria are already met by existing code, report this in your output — do not create unnecessary commits or changes",
 ];
 

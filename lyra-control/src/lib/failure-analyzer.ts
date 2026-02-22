@@ -511,14 +511,25 @@ export async function generateSmartRetryPrompt(input: {
     ? input.acceptanceCriteria.map((ac, i) => `${i + 1}. ${ac}`).join("\n")
     : "(no acceptance criteria defined)";
 
+  // Detect phantom completion and build additional context
+  const isPhantom = input.sessionOutput.includes("PHANTOM COMPLETION");
+  const phantomWarning = isPhantom
+    ? `\n\n## CRITICAL WARNING — PHANTOM COMPLETION DETECTED
+The previous agent FAILED because it reasoned about the task but never created or modified any files.
+You MUST use file-writing tools to create real files. Thinking about code is NOT the same as writing code.
+After creating each file, run \`ls -la <path>\` to verify it exists on disk.
+Before finishing, run \`git diff ${input.baseBranch}..HEAD --stat\` — it MUST show your changes.
+If that diff is empty, your session WILL BE REJECTED.\n`
+    : "";
+
   // Call Lyra's brain with a comprehensive prompt
   const messages: ChatMessage[] = [
     {
       role: "system",
-      content: `You are Lyra, the AI Scrum Master and lead technical advisor. An agent just failed the quality gate for a ticket. Your job is to generate a COMPLETE, SELF-CONTAINED agent prompt that will fix the specific failures and get this ticket to pass the quality gate.
+      content: `You are Lyra, the AI Scrum Master and lead technical advisor. An agent just failed ${isPhantom ? "due to a PHANTOM COMPLETION (it reasoned about code but never wrote any files)" : "the quality gate"} for a ticket. Your job is to generate a COMPLETE, SELF-CONTAINED agent prompt that will fix the specific failures and get this ticket to pass the quality gate.
 
 You must be extremely specific and actionable. The agent receiving your prompt has NO other context — your prompt is all they get (plus the standard role preamble and project CLAUDE.md).
-
+${isPhantom ? "\nThe previous agent produced ZERO file changes. Your prompt MUST emphasize that the agent needs to actually write files, not just reason about them. Include explicit commands to verify files exist after creation." : ""}
 Structure your response as a direct instruction prompt for the agent. Do NOT include any meta-commentary or explanation for the human — write ONLY the agent prompt.`,
     },
     {
@@ -527,7 +538,7 @@ Structure your response as a direct instruction prompt for the agent. Do NOT inc
 Summary: ${input.ticketSummary}
 ${input.ticketDescription ? `Description: ${input.ticketDescription}` : ""}
 Role: ${input.assignedRole}
-Attempt: ${input.attemptCount + 1}
+Attempt: ${input.attemptCount + 1}${phantomWarning}
 
 ## Acceptance Criteria
 ${acList}

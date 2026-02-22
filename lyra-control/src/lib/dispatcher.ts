@@ -76,6 +76,11 @@ if (process.env.NODE_ENV !== "production") {
 // Track already-notified abandoned tickets to avoid spam on every poll cycle
 const notifiedAbandoned = new Set<string>();
 
+/** Clear a ticket from the notifiedAbandoned set so the dispatcher will re-evaluate it. */
+export function resetAbandonedTicket(ticketKey: string) {
+  notifiedAbandoned.delete(ticketKey);
+}
+
 export function getState(): Omit<DispatcherState, "timer" | "activeAgents" | "_polling"> & {
   activeAgentCount: number;
   agents: {
@@ -583,35 +588,84 @@ interface CompletionCostData {
 }
 
 async function handleAgentCompletion(
-  exitCode: number,
+  rawExitCode: number,
   rawOutput: string,
   ctx: CompletionContext,
   costData: CompletionCostData
 ) {
+  let exitCode = rawExitCode;
   state.activeAgents.delete(ctx.ticketKey);
 
-  // Auto-commit safety net: catch uncommitted work before declaring success
+  // Auto-commit safety net: catch uncommitted work on ANY exit code
+  // (agents may crash but leave files on disk — capture them)
   let finalOutput = rawOutput;
+  try {
+    const { stdout: statusOut } = await exec("git", ["status", "--porcelain"], { cwd: ctx.worktreePath });
+    if (statusOut.trim()) {
+      console.warn(`[Dispatcher] ${ctx.ticketKey}: auto-committing uncommitted changes:\n${statusOut.trim()}`);
+      await exec("git", ["add", "-A"], { cwd: ctx.worktreePath });
+      await exec("git", ["commit", "-m", `feat(${ctx.ticketKey}): ${ctx.summary} (auto-commit)`], { cwd: ctx.worktreePath });
+      finalOutput += "\n[Lyra] Auto-committed uncommitted changes.";
+    }
+  } catch (e) {
+    console.error(`[Dispatcher] Auto-commit failed for ${ctx.ticketKey}:`, e);
+  }
+
+  // A1: Detect phantom completions — agent exited 0 but produced zero git commits
   if (exitCode === 0) {
     try {
-      const { stdout: statusOut } = await exec("git", ["status", "--porcelain"], { cwd: ctx.worktreePath });
-      if (statusOut.trim()) {
-        console.warn(`[Dispatcher] ${ctx.ticketKey}: auto-committing uncommitted changes:\n${statusOut.trim()}`);
-        await exec("git", ["add", "-A"], { cwd: ctx.worktreePath });
-        await exec("git", ["commit", "-m", `feat(${ctx.ticketKey}): ${ctx.summary} (auto-commit)`], { cwd: ctx.worktreePath });
-        finalOutput += "\n[Lyra] Auto-committed uncommitted changes.";
-      } else {
-        // Diagnostic: check if branch has ANY commits beyond base
-        try {
-          const { stdout: logOut } = await exec("git", ["log", `${ctx.baseBranch}..HEAD`, "--oneline"], { cwd: ctx.worktreePath });
-          if (!logOut.trim()) {
-            console.log(`[Dispatcher] ${ctx.ticketKey}: No commits on branch — will check if AC already met`);
-          }
-        } catch { /* non-fatal diagnostic */ }
+      const { stdout: logOut } = await exec("git", ["log", `${ctx.baseBranch}..HEAD`, "--oneline"], { cwd: ctx.worktreePath });
+      if (!logOut.trim()) {
+        console.warn(`[Dispatcher] ${ctx.ticketKey}: PHANTOM COMPLETION DETECTED — agent exited 0 with no commits`);
+        finalOutput += "\nPHANTOM COMPLETION DETECTED: Agent exited successfully but produced zero git commits.";
+
+        // Log phantom completion
+        await prisma.auditLog.create({
+          data: {
+            projectId: ctx.projectId,
+            action: "agent.phantom_completion",
+            actor: ctx.agent?.name || "dispatcher",
+            details: JSON.stringify({ ticketKey: ctx.ticketKey, baseBranch: ctx.baseBranch }),
+          },
+        });
+
+        // Count previous phantom completions for this ticket
+        const phantomCount = await prisma.auditLog.count({
+          where: {
+            projectId: ctx.projectId,
+            action: "agent.phantom_completion",
+            details: { contains: ctx.ticketKey },
+          },
+        });
+
+        // If >= 2 phantom completions, force escalation to Opus on next attempt
+        if (phantomCount >= 2) {
+          console.warn(`[Dispatcher] ${ctx.ticketKey}: ${phantomCount} phantom completions — forcing Opus escalation`);
+          await prisma.auditLog.create({
+            data: {
+              projectId: ctx.projectId,
+              action: "agent.force_escalation",
+              actor: "dispatcher",
+              details: JSON.stringify({ ticketKey: ctx.ticketKey, phantomCount, reason: "repeated phantom completions" }),
+            },
+          });
+        }
+
+        // Force failure path so it routes through retry instead of quality gate
+        exitCode = 1;
       }
-    } catch (e) {
-      console.error(`[Dispatcher] Auto-commit failed for ${ctx.ticketKey}:`, e);
+    } catch { /* non-fatal diagnostic */ }
+  }
+
+  // Push branch before quality gate — preserves commits across retries
+  try {
+    const { stdout: logCheck } = await exec("git", ["log", `${ctx.baseBranch}..HEAD`, "--oneline"], { cwd: ctx.worktreePath }).catch(() => ({ stdout: "" }));
+    if (logCheck.trim()) {
+      await exec("git", ["push", "-u", "origin", ctx.branchName, "--force-with-lease"], { cwd: ctx.worktreePath });
+      console.log(`[Dispatcher] ${ctx.ticketKey}: pushed branch ${ctx.branchName} before quality gate`);
     }
+  } catch (e) {
+    console.warn(`[Dispatcher] Pre-gate push failed for ${ctx.ticketKey} (non-fatal):`, e);
   }
 
   const status = exitCode === 0 ? "completed" : "failed";
@@ -1251,7 +1305,23 @@ Do NOT finish until all acceptance criteria AND Definition of Done items are sat
 
   const { resolveModelTier, loadTierConfig } = await import("./team-templates");
   const tierConfig = await loadTierConfig();
-  const tier = resolveModelTier(attemptCount, false, tierConfig);
+  let tier = resolveModelTier(attemptCount, false, tierConfig);
+
+  // A7: Force escalation to Opus if phantom completions triggered force_escalation
+  try {
+    const forceEscalation = await prisma.auditLog.findFirst({
+      where: {
+        projectId,
+        action: "agent.force_escalation",
+        details: { contains: ticketKey },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    if (forceEscalation) {
+      tier = { model: tierConfig.tier2Model, tier: 2, reason: `Forced Opus escalation — repeated phantom completions for ${ticketKey}` };
+    }
+  } catch { /* non-fatal */ }
+
   const resolvedModel = tier.model;
   console.log(`[Dispatcher] ${ticketKey}: ${tier.reason} (tier ${tier.tier}, attempt ${attemptCount})`);
 
