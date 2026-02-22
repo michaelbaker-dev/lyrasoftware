@@ -1,20 +1,49 @@
 import { prisma } from "@/lib/db";
+import { getCurrentBurnRate, projectToSprintEnd, getDailyCostSeries } from "@/lib/cost-projections";
 import ProjectSelector from "@/components/project-selector";
+import DateRangeSelector from "./date-range-selector";
+
+const RANGE_DAYS: Record<string, number> = {
+  "7d": 7,
+  "14d": 14,
+  "30d": 30,
+};
 
 export default async function MetricsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ project?: string }>;
+  searchParams: Promise<{ project?: string; range?: string }>;
 }) {
-  const { project: projectId } = await searchParams;
+  const { project: projectId, range: rangeParam } = await searchParams;
   const now = new Date();
-  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  // Resolve date range — default to 7 days
+  let rangeDays = RANGE_DAYS[rangeParam || "7d"] || 7;
+  let rangeLabel = rangeParam || "7d";
+
+  // Handle "sprint" range — use active sprint dates
+  let sprintRangeStart: Date | null = null;
+  if (rangeParam === "sprint") {
+    const activeSprint = projectId
+      ? await prisma.sprint.findFirst({ where: { project: { id: projectId }, state: "active" } })
+      : await prisma.sprint.findFirst({ where: { state: "active" } });
+    if (activeSprint?.startDate) {
+      sprintRangeStart = activeSprint.startDate;
+      rangeDays = Math.ceil((now.getTime() - activeSprint.startDate.getTime()) / (24 * 60 * 60 * 1000)) || 7;
+      rangeLabel = "sprint";
+    } else {
+      rangeDays = 14;
+      rangeLabel = "14d";
+    }
+  }
+
+  const rangeStart = sprintRangeStart || new Date(now.getTime() - rangeDays * 24 * 60 * 60 * 1000);
 
   // Build project filter
   const projectFilter = projectId ? { projectId } : {};
 
-  // Fetch all data we need in parallel
-  const [sessions, allAgents, projects] = await Promise.all([
+  // Fetch all data in parallel
+  const [sessions, allAgents, projects, auditLogs, burnRate, sprintProjection, dailyCosts] = await Promise.all([
     prisma.session.findMany({
       where: projectFilter,
       select: {
@@ -37,22 +66,33 @@ export default async function MetricsPage({
     prisma.project.findMany({
       select: { id: true, name: true },
     }),
+    prisma.auditLog.findMany({
+      where: {
+        action: "pr.merged",
+        createdAt: { gte: rangeStart },
+        ...(projectId ? { projectId } : {}),
+      },
+      select: { details: true },
+    }),
+    getCurrentBurnRate(projectId),
+    projectToSprintEnd(projectId),
+    getDailyCostSeries(projectId, rangeDays),
   ]);
 
   const hasData = sessions.length > 0;
 
   // --- DORA-like Metrics ---
 
-  // Deployment Frequency: completed sessions per day over last 7 days
+  // Deployment Frequency: completed sessions per day over range
   const completedRecent = sessions.filter(
     (s) =>
       s.status === "completed" &&
       s.completedAt &&
-      s.completedAt >= sevenDaysAgo,
+      s.completedAt >= rangeStart,
   );
   const deploymentFrequency =
     completedRecent.length > 0
-      ? (completedRecent.length / 7).toFixed(1)
+      ? (completedRecent.length / rangeDays).toFixed(1)
       : "0";
 
   // Lead Time: average duration (startedAt -> completedAt) for completed sessions
@@ -157,6 +197,27 @@ export default async function MetricsPage({
       ? `${((runningAgents / totalAgents) * 100).toFixed(0)}%`
       : "—";
 
+  // Auto-Merge Rate: PRs with autoMerge:true / total merged PRs
+  const totalMerged = auditLogs.length;
+  const autoMerged = auditLogs.filter((log) => {
+    try {
+      const d = JSON.parse(log.details);
+      return d.autoMerge === true;
+    } catch {
+      return false;
+    }
+  }).length;
+  const autoMergeRate =
+    totalMerged > 0 ? `${Math.round((autoMerged / totalMerged) * 100)}%` : "—";
+
+  // Tokens per Story Point: sum tokens / sum story points from completed sessions
+  const totalTokens = sessions
+    .filter((s) => s.status === "completed")
+    .reduce((sum, s) => sum + s.tokensUsed, 0);
+  const tokensPerSp = totalTokens > 0 && uniqueTickets.size > 0
+    ? `${Math.round(totalTokens / uniqueTickets.size).toLocaleString()}`
+    : "—";
+
   // --- Cost Breakdown by model ---
   const costByModel = new Map<string, number>();
   for (const s of sessions) {
@@ -170,6 +231,30 @@ export default async function MetricsPage({
     (max, row) => Math.max(max, row.cost),
     0,
   );
+
+  // --- Daily velocity data for chart ---
+  const velocityByDay = new Map<string, { completed: number; failed: number }>();
+  for (const s of sessions) {
+    if (!s.completedAt || s.completedAt < rangeStart) continue;
+    const dateStr = s.completedAt.toISOString().split("T")[0];
+    const existing = velocityByDay.get(dateStr) || { completed: 0, failed: 0 };
+    if (s.status === "completed") existing.completed++;
+    else if (s.status === "failed") existing.failed++;
+    velocityByDay.set(dateStr, existing);
+  }
+
+  // Fill in missing days for velocity
+  const velocityData: { date: string; completed: number; failed: number }[] = [];
+  for (let i = rangeDays - 1; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+    const dateStr = d.toISOString().split("T")[0];
+    const v = velocityByDay.get(dateStr) || { completed: 0, failed: 0 };
+    velocityData.push({ date: dateStr, ...v });
+  }
+  const maxVelocity = Math.max(1, ...velocityData.map((d) => d.completed + d.failed));
+
+  // Max for cost chart
+  const maxDailyCost = Math.max(0.01, ...dailyCosts.map((d) => d.cost));
 
   const doraMetrics = [
     {
@@ -195,9 +280,9 @@ export default async function MetricsPage({
       label: "Agent Success Rate",
       value: hasData ? `${agentSuccessRate}%` : "—",
     },
-    { label: "Auto-Merge Rate", value: "—" },
+    { label: "Auto-Merge Rate", value: autoMergeRate },
     { label: "Avg Cost/Ticket", value: hasData ? avgCostPerTicket : "—" },
-    { label: "Tokens/Story Point", value: "—" },
+    { label: "Tokens/Ticket", value: tokensPerSp },
     { label: "Avg Retries", value: hasData ? avgRetries : "—" },
     { label: "Agent Utilization", value: agentUtilization },
   ];
@@ -219,11 +304,7 @@ export default async function MetricsPage({
         </div>
         <div className="flex gap-2">
           <ProjectSelector projects={projects} />
-          <select className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-1.5 text-sm">
-            <option>Last 7 days</option>
-            <option>Last 30 days</option>
-            <option>Last 90 days</option>
-          </select>
+          <DateRangeSelector />
         </div>
       </div>
 
@@ -253,17 +334,127 @@ export default async function MetricsPage({
         </div>
       </div>
 
-      {/* Velocity Chart Placeholder */}
+      {/* Cost Projections */}
       <div className="rounded-xl border border-gray-800 bg-gray-900 p-5">
-        <h2 className="mb-4 text-lg font-semibold">Velocity</h2>
-        <div className="flex h-48 items-center justify-center text-gray-500">
-          {hasData
-            ? "Chart will be rendered here with DuckDB-powered analytics"
-            : "No session data yet — velocity chart will appear once agents complete work"}
+        <h2 className="mb-4 text-lg font-semibold">Cost Projections</h2>
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+          <div>
+            <div className="text-xs text-gray-500">Daily Burn Rate</div>
+            <div className="mt-1 text-lg font-semibold">
+              ${burnRate.dailyRate.toFixed(2)}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Weekly Burn Rate</div>
+            <div className="mt-1 text-lg font-semibold">
+              ${burnRate.weeklyRate.toFixed(2)}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Sprint Projection</div>
+            <div className="mt-1 text-lg font-semibold">
+              {sprintProjection
+                ? `$${sprintProjection.projectedCost.toFixed(2)}`
+                : "No active sprint"}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Days Remaining</div>
+            <div className="mt-1 text-lg font-semibold">
+              {sprintProjection ? sprintProjection.daysRemaining : "—"}
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* Cost Breakdown */}
+      {/* Velocity Chart */}
+      <div className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+        <h2 className="mb-4 text-lg font-semibold">Velocity</h2>
+        {hasData ? (
+          <div className="h-48 flex items-end gap-px">
+            {velocityData.map((d) => {
+              const completedH = (d.completed / maxVelocity) * 100;
+              const failedH = (d.failed / maxVelocity) * 100;
+              return (
+                <div
+                  key={d.date}
+                  className="flex-1 flex flex-col justify-end items-center group relative"
+                >
+                  <div
+                    className="absolute -top-8 hidden group-hover:block text-xs bg-gray-800 px-2 py-1 rounded whitespace-nowrap z-10"
+                  >
+                    {d.date.slice(5)}: {d.completed} done, {d.failed} failed
+                  </div>
+                  {d.failed > 0 && (
+                    <div
+                      className="w-full bg-red-600 rounded-t-sm"
+                      style={{ height: `${failedH}%`, minHeight: d.failed > 0 ? "2px" : 0 }}
+                    />
+                  )}
+                  <div
+                    className="w-full bg-blue-600 rounded-t-sm"
+                    style={{ height: `${completedH}%`, minHeight: d.completed > 0 ? "2px" : 0 }}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex h-48 items-center justify-center text-gray-500">
+            No session data yet — velocity chart will appear once agents complete work
+          </div>
+        )}
+        <div className="flex justify-between mt-2 text-xs text-gray-500">
+          <span>{velocityData[0]?.date.slice(5)}</span>
+          <span className="flex gap-4">
+            <span className="flex items-center gap-1">
+              <span className="inline-block w-2 h-2 bg-blue-600 rounded-sm" /> Completed
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block w-2 h-2 bg-red-600 rounded-sm" /> Failed
+            </span>
+          </span>
+          <span>{velocityData[velocityData.length - 1]?.date.slice(5)}</span>
+        </div>
+      </div>
+
+      {/* Daily Cost Chart */}
+      <div className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+        <h2 className="mb-4 text-lg font-semibold">Daily Cost</h2>
+        {dailyCosts.some((d) => d.cost > 0) ? (
+          <div className="h-32 flex items-end gap-px">
+            {dailyCosts.map((d) => {
+              const h = (d.cost / maxDailyCost) * 100;
+              return (
+                <div
+                  key={d.date}
+                  className="flex-1 flex flex-col justify-end items-center group relative"
+                >
+                  <div
+                    className="absolute -top-8 hidden group-hover:block text-xs bg-gray-800 px-2 py-1 rounded whitespace-nowrap z-10"
+                  >
+                    {d.date.slice(5)}: ${d.cost.toFixed(2)}
+                  </div>
+                  <div
+                    className="w-full bg-emerald-600 rounded-t-sm"
+                    style={{ height: `${h}%`, minHeight: d.cost > 0 ? "2px" : 0 }}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex h-32 items-center justify-center text-gray-500">
+            No cost data yet
+          </div>
+        )}
+        <div className="flex justify-between mt-2 text-xs text-gray-500">
+          <span>{dailyCosts[0]?.date.slice(5)}</span>
+          <span>{dailyCosts[dailyCosts.length - 1]?.date.slice(5)}</span>
+        </div>
+      </div>
+
+      {/* Cost Breakdown by Model */}
       <div className="rounded-xl border border-gray-800 bg-gray-900 p-5">
         <h2 className="mb-4 text-lg font-semibold">Cost Breakdown</h2>
         {costBreakdown.length > 0 ? (
