@@ -7,6 +7,7 @@
  */
 
 import { chat } from "./openrouter";
+import { isClaudeCodeModel, chatViaClaude } from "./claude-code-chat";
 import { readFileSync, writeFileSync, chmodSync } from "fs";
 import { join } from "path";
 import { execFile, spawn } from "child_process";
@@ -30,9 +31,13 @@ export interface LaunchConfig {
     cwd?: string;
     port?: number;
     healthUrl?: string;
+    startupTime?: number;
+    portEnvVar?: string;
   }[];
   envSetup?: string;
   prelaunchCommands?: string[];
+  serviceStartCommands?: { name: string; command: string; readyCheck?: string; readyTimeout?: number }[];
+  testingInstructions?: string[];
 }
 
 export interface ValidationResult {
@@ -79,31 +84,69 @@ async function getLaunchModel(): Promise<string> {
 
 // ── Analyze Launch Config via AI ──────────────────────────────────────
 
-const LAUNCH_SYSTEM_PROMPT = `You are analyzing a codebase to determine how to launch it locally. Given the project analysis data, determine the correct install and launch commands.
+const LAUNCH_SYSTEM_PROMPT = `You are an expert DevOps engineer analyzing a codebase to generate a complete local launch configuration. Your goal is to produce a config that starts EVERYTHING needed — from external services to the app itself — so the user can go from zero to running with one command.
 
-Return ONLY valid JSON (no markdown fences) matching this exact structure:
+Return ONLY valid JSON (no markdown fences) matching this structure:
 {
+  "serviceStartCommands": [
+    { "name": "description", "command": "start command", "readyCheck": "check command", "readyTimeout": 30 }
+  ],
   "installCommands": [{ "name": "description", "command": "shell command", "cwd": "optional subdir" }],
-  "processes": [{ "name": "process name", "command": "shell command", "cwd": "optional subdir", "port": 3000, "healthUrl": "http://localhost:3000" }],
-  "envSetup": "optional bash commands for env setup",
-  "prelaunchCommands": ["optional pre-launch shell commands"]
+  "prelaunchCommands": ["shell commands run before starting app processes"],
+  "processes": [
+    { "name": "process name", "command": "shell command", "cwd": "optional subdir", "port": 3000, "portEnvVar": "PORT", "healthUrl": "http://localhost:3000", "startupTime": 5 }
+  ],
+  "envSetup": "optional bash export commands",
+  "testingInstructions": ["Step 1: Open http://localhost:3000 in your browser", "Step 2: ..."]
 }
 
-Rules:
-- Detect ALL processes needed (frontend, backend, database, etc.)
-- Use the correct package manager (npm, pnpm, yarn, cargo, pip, go, etc.)
-- For monorepos, include install + start commands for each workspace
-- Set healthUrl only for HTTP services (port-based health check)
-- If the project has separate frontend/backend dirs, set cwd for each
-- Include database migrations in prelaunchCommands if detected
+## Service Start Commands
+- If docker-compose services are detected, use "docker compose up -d <service>" for each needed service
+- If a database is needed but no docker-compose exists, include a readyCheck to verify it's running (e.g. "pg_isready -h localhost" for PostgreSQL, "redis-cli ping" for Redis, "mongosh --eval 'db.runCommand({ping:1})' --quiet" for MongoDB, "mysqladmin ping -h localhost" for MySQL)
+- Set readyTimeout appropriately — databases typically need 10-30s to start, Redis is near-instant
+- Always include a readyCheck for each service so the script can wait for it
+
+## Port Handling
+- For each process that uses a port, set "port" AND "portEnvVar" (the env var that controls the port, e.g. "PORT", "VITE_PORT", "API_PORT")
+- The launch script will automatically detect port conflicts: if a port is already in use, it increments the port and sets the env var accordingly.
+- Do NOT hardcode ports into commands — use env vars so the script can adjust them. Example: use {"command": "npm run dev", "port": 3000, "portEnvVar": "PORT"} not {"command": "PORT=3000 npm run dev", "port": 3000}
+
+## Install Commands
+- Use the correct package manager detected for the project
+- For monorepos, install in each workspace that needs it
+- For Go: "go mod download"; for Rust: handled by cargo build; for Python: "pip install -r requirements.txt" or "poetry install"
+
+## Pre-launch Commands
+- Include database migrations if the project uses an ORM (e.g. "npx prisma migrate deploy", "npx prisma generate", "python manage.py migrate")
+- Include build steps if the project requires compilation before running (e.g. "go build -o ./bin/server ./cmd/server", "cargo build", "npm run build")
+- Include database seeding if a seed script exists
+
+## Processes
+- Detect ALL processes: frontend, backend, API, workers, etc.
+- For Node.js: prefer "npm run dev" or the dev script from package.json
+- For Go: run the compiled binary (e.g. "./bin/server") or "go run ./cmd/server"
+- For Rust: "cargo run" or run the compiled binary
+- For Python: "python manage.py runserver", "uvicorn main:app", "flask run", etc.
+- Set healthUrl for HTTP services only
+- Set startupTime (seconds) for slow-starting processes (default 5). Go/Rust binaries: 2-3s. Node dev servers: 5-10s. Java/heavy frameworks: 15-30s.
 - Do NOT include "cd" in commands — use "cwd" field instead
-- PATH ACCURACY IS CRITICAL: TypeScript outDir path mapping preserves the directory structure relative to rootDir. Example: if rootDir is "src" and outDir is "dist/server", then "src/server/index.ts" compiles to "dist/server/server/index.js" (the "server" subdir is preserved under outDir). Never guess — always trace: strip rootDir prefix from source path, prepend outDir.
-- Prefer using package.json scripts over raw "node <path>" commands.
-- IMPORTANT: Scripts prefixed with "subdirname:" (e.g. "server:start", "server:dev") are NOT root scripts — they come from that subdirectory's own package.json. To run them, set "cwd" to the subdirectory and use the unprefixed script name. Example: if you see "server:dev": "node --watch src/index.js", use {"command": "npm run dev", "cwd": "server"}, NOT "npm run server:dev".
-- Check the port numbers in the source code / config — do not assume defaults. If the code says PORT=3001, use 3001.`;
+
+## Testing Instructions
+- Include 2-5 concrete steps the user should take to verify the app works
+- For web apps: "Open http://localhost:PORT in your browser"
+- For APIs: "Run: curl http://localhost:PORT/api/health" or a specific endpoint
+- For CLI tools: "Run: ./bin/tool --help"
+- If there's a test command: "Run: npm test" or equivalent
+- Be specific to THIS project — reference actual routes, pages, or endpoints from the analysis
+
+## Path Rules
+- Scripts prefixed with "subdirname:" (e.g. "server:dev") are NOT root scripts — they come from that subdirectory's package.json. Use unprefixed script with cwd.
+- PATH ACCURACY IS CRITICAL for TypeScript: outDir path mapping preserves directory structure relative to rootDir. Trace carefully.
+- Prefer package.json scripts over raw commands.
+- Use detected port hints — do not guess defaults.`;
 
 function buildAnalysisPrompt(analysis: CodebaseAnalysis): string {
-  return `Analyze this project and determine launch configuration:
+  let prompt = `Analyze this project and determine launch configuration:
 
 Framework: ${analysis.framework}
 Language: ${analysis.language}
@@ -125,30 +168,77 @@ Config Summary: ${JSON.stringify(analysis.configSummary)}
 Environment Variables: ${JSON.stringify(analysis.envVars)}
 
 Build Output Directory: ${analysis.buildOutput || "unknown"}`;
+
+  if (analysis.serviceRequirements?.length)
+    prompt += `\n\nDetected External Service Requirements: ${JSON.stringify(analysis.serviceRequirements)}`;
+
+  if (analysis.dockerComposeServices?.length)
+    prompt += `\n\nDocker Compose Services (available to start): ${JSON.stringify(analysis.dockerComposeServices)}`;
+
+  if (analysis.portHints && Object.keys(analysis.portHints).length > 0)
+    prompt += `\n\nDetected Port Configuration: ${JSON.stringify(analysis.portHints)}`;
+
+  if (analysis.connectionStrings && Object.keys(analysis.connectionStrings).length > 0)
+    prompt += `\n\nConnection Strings (from .env.example): ${JSON.stringify(analysis.connectionStrings)}`;
+
+  if (analysis.prismaProvider)
+    prompt += `\n\nPrisma Datasource Provider: ${analysis.prismaProvider}`;
+
+  if (analysis.setupInstructions)
+    prompt += `\n\nREADME Setup Instructions:\n${analysis.setupInstructions}`;
+
+  return prompt;
 }
 
 function parseConfigResponse(rawContent: string): LaunchConfig {
   let jsonStr = rawContent.trim();
   const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenceMatch) jsonStr = fenceMatch[1].trim();
-  return JSON.parse(jsonStr) as LaunchConfig;
+  const parsed = JSON.parse(jsonStr);
+
+  // Normalize per-process fields
+  const processes = Array.isArray(parsed.processes)
+    ? parsed.processes.map((p: Record<string, unknown>) => ({
+        name: p.name,
+        command: p.command,
+        cwd: p.cwd || undefined,
+        port: typeof p.port === "number" ? p.port : undefined,
+        healthUrl: p.healthUrl || undefined,
+        startupTime: typeof p.startupTime === "number" ? p.startupTime : undefined,
+        portEnvVar: typeof p.portEnvVar === "string" ? p.portEnvVar : undefined,
+      }))
+    : [];
+
+  return {
+    installCommands: Array.isArray(parsed.installCommands) ? parsed.installCommands : [],
+    processes,
+    envSetup: parsed.envSetup || undefined,
+    prelaunchCommands: Array.isArray(parsed.prelaunchCommands) ? parsed.prelaunchCommands : undefined,
+    serviceStartCommands: Array.isArray(parsed.serviceStartCommands) ? parsed.serviceStartCommands : undefined,
+    testingInstructions: Array.isArray(parsed.testingInstructions) ? parsed.testingInstructions : undefined,
+  };
 }
 
 export async function analyzeLaunchConfig(
   projectId: string,
-  analysis: CodebaseAnalysis
+  analysis: CodebaseAnalysis,
+  modelOverride?: string
 ): Promise<LaunchConfig> {
-  const model = await getLaunchModel();
-  const response = await chat(
-    [
-      { role: "system", content: LAUNCH_SYSTEM_PROMPT },
-      { role: "user", content: buildAnalysisPrompt(analysis) },
-    ],
-    model,
-    { projectId, category: "launch-analysis" }
-  );
+  const model = modelOverride || await getLaunchModel();
+  const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
+    { role: "system", content: LAUNCH_SYSTEM_PROMPT },
+    { role: "user", content: buildAnalysisPrompt(analysis) },
+  ];
 
-  const rawContent = response.choices[0]?.message?.content || "";
+  let rawContent: string;
+  if (isClaudeCodeModel(model)) {
+    const result = await chatViaClaude(messages, model);
+    rawContent = result.content;
+  } else {
+    const response = await chat(messages, model, { projectId, category: "launch-analysis" });
+    rawContent = response.choices[0]?.message?.content || "";
+  }
+
   return parseConfigResponse(rawContent);
 }
 
@@ -159,15 +249,15 @@ export async function fixLaunchConfig(
   analysis: CodebaseAnalysis,
   previousConfig: LaunchConfig,
   failedStep: string,
-  errorOutput: string
+  errorOutput: string,
+  modelOverride?: string
 ): Promise<LaunchConfig> {
-  const model = await getLaunchModel();
-  const response = await chat(
-    [
-      { role: "system", content: LAUNCH_SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `${buildAnalysisPrompt(analysis)}
+  const model = modelOverride || await getLaunchModel();
+  const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
+    { role: "system", content: LAUNCH_SYSTEM_PROMPT },
+    {
+      role: "user",
+      content: `${buildAnalysisPrompt(analysis)}
 
 The previous launch config caused an error:
 
@@ -177,13 +267,18 @@ Error during "${failedStep}":
 ${errorOutput.slice(-2000)}
 
 Fix the configuration to resolve this error. Return the corrected full JSON config.`,
-      },
-    ],
-    model,
-    { projectId, category: "launch-analysis" }
-  );
+    },
+  ];
 
-  const rawContent = response.choices[0]?.message?.content || "";
+  let rawContent: string;
+  if (isClaudeCodeModel(model)) {
+    const result = await chatViaClaude(messages, model);
+    rawContent = result.content;
+  } else {
+    const response = await chat(messages, model, { projectId, category: "launch-analysis" });
+    rawContent = response.choices[0]?.message?.content || "";
+  }
+
   return parseConfigResponse(rawContent);
 }
 
@@ -194,6 +289,36 @@ export async function validateLaunchScript(
   projectPath: string,
   config: LaunchConfig
 ): Promise<ValidationResult> {
+  // 0. Validate service start commands
+  for (const svc of config.serviceStartCommands ?? []) {
+    const parts = svc.command.split(/\s+/);
+    try {
+      await execAsync(parts[0], parts.slice(1), { cwd: projectPath, timeout: 10_000 });
+    } catch { /* non-fatal — service may already be running */ }
+
+    if (svc.readyCheck) {
+      const checkParts = svc.readyCheck.split(/\s+/);
+      const timeout = (svc.readyTimeout ?? 30) * 1000;
+      const start = Date.now();
+      let ready = false;
+      while (Date.now() - start < timeout) {
+        try {
+          await execAsync(checkParts[0], checkParts.slice(1), { timeout: 5_000 });
+          ready = true;
+          break;
+        } catch { /* not ready yet */ }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      if (!ready) {
+        return {
+          success: false,
+          failedStep: `service-ready: ${svc.name}`,
+          error: `${svc.name} did not become ready within ${svc.readyTimeout ?? 30}s`,
+        };
+      }
+    }
+  }
+
   // 1. Validate install commands
   for (const cmd of config.installCommands) {
     const cwd = cmd.cwd ? join(projectPath, cmd.cwd) : projectPath;
@@ -236,7 +361,7 @@ export async function validateLaunchScript(
   for (const proc of config.processes) {
     const cwd = proc.cwd ? join(projectPath, proc.cwd) : projectPath;
     const parts = proc.command.split(/\s+/);
-    const result = await checkProcessStarts(parts[0], parts.slice(1), cwd);
+    const result = await checkProcessStarts(parts[0], parts.slice(1), cwd, (proc.startupTime ?? 5) * 1000);
     if (!result.success) {
       return {
         success: false,
@@ -261,11 +386,12 @@ export async function validateLaunchScript(
   return { success: true };
 }
 
-/** Start a process and check it doesn't crash within 5 seconds */
+/** Start a process and check it doesn't crash within the given timeout */
 async function checkProcessStarts(
   cmd: string,
   args: string[],
-  cwd: string
+  cwd: string,
+  timeoutMs: number = 5_000
 ): Promise<{ success: boolean; error?: string }> {
   return new Promise((resolve) => {
     let stderr = "";
@@ -293,7 +419,7 @@ async function checkProcessStarts(
       }
     });
 
-    // If process is still running after 5s, it started successfully
+    // If process is still running after timeout, it started successfully
     setTimeout(() => {
       try {
         if (child.pid) process.kill(-child.pid, "SIGTERM");
@@ -301,7 +427,7 @@ async function checkProcessStarts(
         // Process may have already exited
       }
       resolve({ success: true });
-    }, 5_000);
+    }, timeoutMs);
   });
 }
 
@@ -354,9 +480,10 @@ export function renderLaunchScript(
 export async function generateLaunchScript(
   projectId: string,
   projectPath: string,
-  analysis: CodebaseAnalysis
+  analysis: CodebaseAnalysis,
+  modelOverride?: string
 ): Promise<{ scriptPath: string; config: LaunchConfig }> {
-  const config = await analyzeLaunchConfig(projectId, analysis);
+  const config = await analyzeLaunchConfig(projectId, analysis, modelOverride);
   const projectName =
     projectPath.split("/").filter(Boolean).pop() || "project";
   const script = renderLaunchScript(config, projectName);
@@ -540,7 +667,8 @@ export async function generateAndValidateLaunchScript(
   projectId: string,
   projectPath: string,
   analysis: CodebaseAnalysis,
-  maxRetries: number = 3
+  maxRetries: number = 3,
+  modelOverride?: string
 ): Promise<GenerateAndValidateResult> {
   const projectName =
     projectPath.split("/").filter(Boolean).pop() || "project";
@@ -559,7 +687,7 @@ export async function generateAndValidateLaunchScript(
         attempt,
         maxRetries,
       });
-      config = await analyzeLaunchConfig(projectId, analysis);
+      config = await analyzeLaunchConfig(projectId, analysis, modelOverride);
     } else {
       lyraEvents.emit("launch:progress", {
         projectId,
@@ -573,7 +701,8 @@ export async function generateAndValidateLaunchScript(
         analysis,
         config!,
         lastFailedStep!,
-        lastError!
+        lastError!,
+        modelOverride
       );
     }
 

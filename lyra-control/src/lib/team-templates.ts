@@ -7,13 +7,13 @@ import { prisma } from "./db";
 
 // ── Types ────────────────────────────────────────────────────────────
 
-interface TemplateAgent {
+export interface TemplateAgent {
   role: string; // Data-driven: validated against RoleConfig table
   personality: string;
   model?: string; // null/undefined = inherit from team
 }
 
-interface TemplateTeam {
+export interface TemplateTeam {
   name: string;
   specialization: string;
   model: string;
@@ -25,7 +25,7 @@ interface TemplateTeam {
   agents: TemplateAgent[];
 }
 
-interface TemplateConfig {
+export interface TemplateConfig {
   teams: TemplateTeam[];
 }
 
@@ -105,6 +105,18 @@ export interface ResolvedModel {
 export function resolveClaudeModel(modelId: string): ResolvedModel {
   const id = modelId.toLowerCase();
 
+  // Version-specific Claude Code models
+  if (id === "claude-code/opus-4.6") {
+    return { model: "claude-opus-4-6", isNative: true };
+  }
+  if (id === "claude-code/sonnet-4.6") {
+    return { model: "claude-sonnet-4-6", isNative: true };
+  }
+  if (id === "claude-code/haiku-4.5") {
+    return { model: "claude-haiku-4-5", isNative: true };
+  }
+
+  // Generic aliases (latest)
   if (id === "claude-code/opus" || id.includes("claude-opus")) {
     return { model: "opus", isNative: true };
   }
@@ -134,7 +146,7 @@ export function resolveClaudeModel(modelId: string): ResolvedModel {
 
 // ── Built-in templates ───────────────────────────────────────────────
 
-const FULL_STACK_TEMPLATE: TemplateConfig = {
+export const FULL_STACK_TEMPLATE: TemplateConfig = {
   teams: [
     {
       name: "Architecture",
@@ -259,7 +271,7 @@ const FULL_STACK_TEMPLATE: TemplateConfig = {
   ],
 };
 
-const BACKEND_ONLY_TEMPLATE: TemplateConfig = {
+export const BACKEND_ONLY_TEMPLATE: TemplateConfig = {
   teams: [
     {
       name: "Architecture",
@@ -316,7 +328,7 @@ const BACKEND_ONLY_TEMPLATE: TemplateConfig = {
   ],
 };
 
-const MINIMAL_TEMPLATE: TemplateConfig = {
+export const MINIMAL_TEMPLATE: TemplateConfig = {
   teams: [
     {
       name: "Development",
@@ -408,21 +420,17 @@ export async function getTemplates() {
   });
 }
 
-export async function applyTemplate(
+/**
+ * Apply a TemplateConfig directly to a project — creates teams + agents in DB.
+ * This is the core logic extracted so it can be used both by applyTemplate()
+ * (template name lookup) and by the onboarding team step (custom config).
+ */
+export async function applyConfig(
   projectId: string,
-  templateName: string
+  config: TemplateConfig
 ): Promise<{ logs: string[] }> {
   const logs: string[] = [];
 
-  const template = await prisma.teamTemplate.findUnique({
-    where: { name: templateName },
-  });
-
-  if (!template) {
-    throw new Error(`Template "${templateName}" not found`);
-  }
-
-  const config: TemplateConfig = JSON.parse(template.config);
   const project = await prisma.project.findUnique({ where: { id: projectId } });
   if (!project) {
     throw new Error("Project not found");
@@ -437,7 +445,7 @@ export async function applyTemplate(
   await prisma.team.deleteMany({ where: { projectId } });
   logs.push("Cleared existing teams");
 
-  // Create teams and agents from template
+  // Create teams and agents from config
   for (const teamDef of config.teams) {
     const team = await prisma.team.create({
       data: {
@@ -483,6 +491,23 @@ export async function applyTemplate(
     }
   }
 
-  logs.push(`Applied template "${templateName}" successfully`);
   return { logs };
+}
+
+export async function applyTemplate(
+  projectId: string,
+  templateName: string
+): Promise<{ logs: string[] }> {
+  const template = await prisma.teamTemplate.findUnique({
+    where: { name: templateName },
+  });
+
+  if (!template) {
+    throw new Error(`Template "${templateName}" not found`);
+  }
+
+  const config: TemplateConfig = JSON.parse(template.config);
+  const result = await applyConfig(projectId, config);
+  result.logs.push(`Applied template "${templateName}" successfully`);
+  return result;
 }

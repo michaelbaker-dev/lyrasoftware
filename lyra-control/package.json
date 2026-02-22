@@ -14,12 +14,15 @@
   "dependencies": {
     "@prisma/client": "^6.0.0",
     "@tailwindcss/postcss": "^4.1.18",
+    "bcrypt": "^6.0.0",
     "handlebars": "^4.7.0",
+    "iron-session": "^8.0.4",
     "next": "^15.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
     "@types/node": "^20.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

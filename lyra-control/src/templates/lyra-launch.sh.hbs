@@ -42,9 +42,73 @@ wait_for_health() {
   return 1
 }
 
+# Check if a port is in use; if so, find the next free port
+# Usage: check_port PORT ENV_VAR_NAME
+# Sets the env var to the actual port (original or incremented)
+check_port() {
+  local port="$1"
+  local env_var="$2"
+  local max_tries=10
+  local try=0
+
+  while [ $try -lt $max_tries ]; do
+    if ! lsof -ti :"$port" >/dev/null 2>&1; then
+      # Port is free
+      export "$env_var=$port"
+      echo "  $env_var=$port (available)"
+      return 0
+    fi
+    # Port occupied — identify what's using it
+    local occupant
+    occupant=$(lsof -ti :"$port" 2>/dev/null | head -1)
+    local occupant_cmd
+    occupant_cmd=$(ps -p "$occupant" -o comm= 2>/dev/null || echo "unknown")
+    echo "  Port $port is in use by $occupant_cmd (PID $occupant)"
+    port=$((port + 1))
+    try=$((try + 1))
+  done
+  echo "WARNING: Could not find a free port near $1 for $env_var"
+  export "$env_var=$1"
+  return 1
+}
+
 {{#if envSetup}}
 # ── Environment Setup ──
 {{{envSetup}}}
+
+{{/if}}
+# ── Port Resolution ──
+{{#each processes}}
+{{#if this.port}}
+{{#if this.portEnvVar}}
+echo "Checking port {{this.port}} for {{this.name}}..."
+check_port {{this.port}} {{this.portEnvVar}}
+{{/if}}
+{{/if}}
+{{/each}}
+
+{{#if serviceStartCommands}}
+# ── Start External Services ──
+{{#each serviceStartCommands}}
+echo "Starting {{this.name}}..."
+{{this.command}} || echo "WARNING: {{this.name}} start command failed, it may already be running"
+{{#if this.readyCheck}}
+echo "Waiting for {{this.name}} to be ready..."
+READY_ELAPSED=0
+READY_TIMEOUT={{#if this.readyTimeout}}{{this.readyTimeout}}{{else}}30{{/if}}
+while [ $READY_ELAPSED -lt $READY_TIMEOUT ]; do
+  if {{this.readyCheck}} >/dev/null 2>&1; then
+    echo "  {{this.name}} is ready!"
+    break
+  fi
+  sleep 1
+  READY_ELAPSED=$((READY_ELAPSED + 1))
+done
+if [ $READY_ELAPSED -ge $READY_TIMEOUT ]; then
+  echo "WARNING: {{this.name}} did not become ready within ${READY_TIMEOUT}s — continuing anyway"
+fi
+{{/if}}
+{{/each}}
 
 {{/if}}
 # ── Install Dependencies ──
@@ -57,7 +121,7 @@ echo "Installing: {{this.name}}..."
 # ── Pre-launch Commands ──
 {{#each prelaunchCommands}}
 echo "Running: {{this}}..."
-{{this}}
+{{this}} || echo "WARNING: pre-launch command failed ({{this}}), continuing..."
 {{/each}}
 
 {{/if}}
@@ -81,12 +145,40 @@ echo "════════════════════════�
 echo "  {{projectName}} is running!"
 {{#each processes}}
 {{#if this.port}}
+{{#if this.portEnvVar}}
+echo "  {{this.name}}: http://localhost:${{this.portEnvVar}}"
+{{else}}
 echo "  {{this.name}}: http://localhost:{{this.port}}"
 {{/if}}
+{{/if}}
 {{/each}}
+{{#if testingInstructions}}
+echo ""
+echo "  How to test:"
+{{#each testingInstructions}}
+echo "    - {{this}}"
+{{/each}}
+{{/if}}
 echo "  Press Ctrl+C to stop all processes"
 echo "═══════════════════════════════════════"
 echo ""
 
-# Wait for all background processes
-wait
+# Keep alive while any process is running
+if [ ${#PIDS[@]} -gt 0 ]; then
+  while true; do
+    ALL_DEAD=true
+    for pid in "${PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        ALL_DEAD=false
+        break
+      fi
+    done
+    if $ALL_DEAD; then
+      echo "All processes have exited."
+      break
+    fi
+    sleep 2
+  done
+else
+  echo "No background processes were started."
+fi

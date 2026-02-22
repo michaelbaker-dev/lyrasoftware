@@ -38,6 +38,7 @@ model Project {
   githubToken       String?   // Per-project GitHub PAT (overrides default)
   breakdownContent String?
   breakdownStatus  String  @default("pending")
+  teamConfig       String?  // JSON: TemplateConfig — saved from team setup step
   archProfile     String   @default("simple")  // "simple" | "complex"
   baseBranch      String   @default("main")    // PR target: "main" or "develop"
   environments    String?  // JSON: [{ name, port, branch }]
@@ -295,4 +296,17 @@ model RoleConfig {
   color     String   @default("gray") // UI badge color
   isBuiltIn Boolean  @default(false)  // true for core roles, prevents deletion
   createdAt DateTime @default(now())
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  passwordHash   String
+  name           String?
+  role           String    @default("admin")
+  lastLoginAt    DateTime?
+  failedAttempts Int       @default(0)
+  lockedUntil    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 }

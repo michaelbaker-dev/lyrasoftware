@@ -6,7 +6,7 @@
 
 import { prisma } from "./db";
 import { lyraEvents } from "./lyra-events";
-import { CLOUD_MODELS } from "@/app/onboarding/models";
+import { CLOUD_MODELS } from "@/app/(dashboard)/onboarding/models";
 
 // ── Types ─────────────────────────────────────────────────────────────
 

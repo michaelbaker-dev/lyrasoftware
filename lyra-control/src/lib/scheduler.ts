@@ -10,6 +10,7 @@ import { processQueue } from "./messaging";
 import { registerNotificationHandlers } from "./notifications";
 import { runDailyStandup, runSprintHealthCheck, runStaleTicketCheck } from "./ceremonies";
 import { runOversightCheck } from "./lyra-oversight";
+import { reconcileTriageEntries } from "./triage-reconciler";
 
 interface ScheduledTask {
   name: string;
@@ -90,6 +91,17 @@ function initTasks() {
   // Lyra active oversight — every 10 minutes
   registerTask("lyra-oversight", 10 * 60_000, async () => {
     await runOversightCheck();
+  });
+
+  // Triage reconciliation — every 10 minutes
+  registerTask("triage-reconciliation", 10 * 60_000, async () => {
+    const triageResult = await reconcileTriageEntries();
+    const total = triageResult.resolved + triageResult.ambiguousResolved;
+    if (total > 0) {
+      console.log(
+        `[Scheduler] Triage reconciliation: ${total} resolved, ${triageResult.unchanged} unchanged`
+      );
+    }
   });
 }
 

@@ -85,6 +85,57 @@ export async function chat(
   costContext?: ChatCostContext,
   options?: ChatOptions
 ): Promise<ChatResponse> {
+  // Auto-route claude-code/* models through the CLI instead of OpenRouter
+  if (model.startsWith("claude-code/")) {
+    const { chatViaClaude } = await import("./claude-code-chat");
+    const startTime = Date.now();
+    const result = await chatViaClaude(messages, model);
+    const durationMs = Date.now() - startTime;
+
+    // Track usage
+    try {
+      await trackUsage({
+        projectId: costContext?.projectId,
+        sessionId: costContext?.sessionId,
+        agentId: costContext?.agentId,
+        teamId: costContext?.teamId,
+        category: costContext?.category || "general",
+        ticketKey: costContext?.ticketKey,
+        provider: "claude-code",
+        requestedModel: model,
+        actualModel: result.cliModel,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        cost: 0, // Max subscription
+        durationMs,
+      });
+    } catch (e) {
+      console.error("[OpenRouter→ClaudeCode] Cost tracking failed (non-fatal):", e);
+    }
+
+    // Return a ChatResponse-shaped object so callers work unchanged
+    return {
+      id: `claude-code-${Date.now()}`,
+      model: result.cliModel,
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: result.content,
+          },
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        cost: 0,
+      },
+    };
+  }
+
   const apiKey = await getApiKey();
   if (!apiKey) {
     throw new Error(

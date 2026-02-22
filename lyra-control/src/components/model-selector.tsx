@@ -6,7 +6,7 @@ import {
   getLastModelSelection,
   saveLastModelSelection,
   type CatalogModel,
-} from "@/app/settings/actions";
+} from "@/app/(dashboard)/settings/actions";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 

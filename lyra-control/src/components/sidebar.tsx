@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { logoutAction } from "@/app/(auth)/actions";
 
 const navigation = [
   { name: "Dashboard", href: "/", icon: "⬡" },
@@ -50,7 +51,16 @@ export function Sidebar() {
         })}
       </nav>
       <div className="border-t border-gray-800 p-4">
-        <div className="text-xs text-gray-500">Lyra Control v0.1.0</div>
+        <form action={logoutAction}>
+          <button
+            type="submit"
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200"
+          >
+            <span className="text-lg">⏻</span>
+            Sign out
+          </button>
+        </form>
+        <div className="mt-2 text-xs text-gray-500">Lyra Control v0.1.0</div>
       </div>
     </aside>
   );

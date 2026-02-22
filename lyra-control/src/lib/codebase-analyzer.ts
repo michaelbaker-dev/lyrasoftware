@@ -48,6 +48,16 @@ export interface CodebaseAnalysis {
   codeStats: CodeStats;
   sourceExcerpts: Record<string, string>;
   docFiles: Record<string, string>;
+  // Launch enrichment fields
+  serviceRequirements: string[];
+  dockerComposeServices: {
+    name: string; image?: string; ports?: string[];
+    environment?: Record<string, string>; depends_on?: string[];
+  }[];
+  portHints: Record<string, number>;
+  connectionStrings: Record<string, string>;
+  prismaProvider: string | null;
+  setupInstructions: string | null;
 }
 
 export type AnalysisMode = "full" | "launch";
@@ -81,6 +91,12 @@ export async function analyzeCodebase(repoPath: string, mode: AnalysisMode = "fu
     codeStats: { totalFiles: 0, totalLines: 0, byExtension: {} },
     sourceExcerpts: {},
     docFiles: {},
+    serviceRequirements: [],
+    dockerComposeServices: [],
+    portHints: {},
+    connectionStrings: {},
+    prismaProvider: null,
+    setupInstructions: null,
   };
 
   // Detect package manager
@@ -194,6 +210,14 @@ export async function analyzeCodebase(repoPath: string, mode: AnalysisMode = "fu
   analysis.configSummary = collectConfigSummary(repoPath);
   analysis.envVars = collectEnvVars(repoPath);
   analysis.monorepoType = detectMonorepo(repoPath);
+
+  // ── Launch enrichment (fast single-file reads, runs in both modes) ──
+  analysis.connectionStrings = collectConnectionStrings(repoPath);
+  analysis.serviceRequirements = detectServiceRequirements(repoPath, allDeps, analysis.connectionStrings);
+  analysis.dockerComposeServices = parseDockerCompose(repoPath);
+  analysis.portHints = collectPortHints(repoPath, analysis.scripts);
+  analysis.prismaProvider = extractPrismaProvider(repoPath);
+  analysis.setupInstructions = extractSetupInstructions(analysis.existingDocs);
 
   // ── Deep inspection (skip in launch mode for speed) ────────────
   if (mode === "full") {
@@ -407,6 +431,280 @@ function findFile(dir: string, names: string[]): string | null {
     if (existsSync(fullPath)) return fullPath;
   }
   return null;
+}
+
+// ── Launch enrichment functions ────────────────────────────────────
+
+function detectServiceRequirements(
+  repoPath: string,
+  deps: string[],
+  connectionStrings: Record<string, string>
+): string[] {
+  const services: string[] = [];
+
+  const depMap: [string[], string][] = [
+    [["pg", "@prisma/client", "typeorm", "sequelize", "knex", "drizzle-orm"], "PostgreSQL"],
+    [["redis", "ioredis"], "Redis"],
+    [["mongodb", "mongoose"], "MongoDB"],
+    [["mysql2", "mysql"], "MySQL"],
+    [["@elastic/elasticsearch"], "Elasticsearch"],
+  ];
+
+  for (const [packages, service] of depMap) {
+    if (packages.some((p) => deps.includes(p))) {
+      // Try to extract host:port from connection strings
+      let detail = service;
+      for (const [, value] of Object.entries(connectionStrings)) {
+        const urlMatch = value.match(
+          new RegExp(`${service.toLowerCase().replace("sql", "(?:sql|gresql)")}://[^@]*@([^/]+)`, "i")
+        );
+        if (urlMatch) {
+          detail = `${service} on ${urlMatch[1]}`;
+          break;
+        }
+      }
+      if (!services.some((s) => s.startsWith(service))) {
+        services.push(detail);
+      }
+    }
+  }
+
+  // Check Prisma provider for confirmation
+  const prismaProvider = extractPrismaProvider(repoPath);
+  if (prismaProvider) {
+    const providerMap: Record<string, string> = {
+      postgresql: "PostgreSQL",
+      mysql: "MySQL",
+      sqlite: "SQLite",
+      mongodb: "MongoDB",
+      sqlserver: "SQL Server",
+    };
+    const svcName = providerMap[prismaProvider];
+    if (svcName && svcName !== "SQLite" && !services.some((s) => s.startsWith(svcName))) {
+      services.push(svcName);
+    }
+  }
+
+  return services;
+}
+
+function parseDockerCompose(repoPath: string): {
+  name: string; image?: string; ports?: string[];
+  environment?: Record<string, string>; depends_on?: string[];
+}[] {
+  const composePath = findFile(repoPath, ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]);
+  if (!composePath) return [];
+
+  try {
+    const content = readFileSync(composePath, "utf-8");
+    const lines = content.split("\n");
+    const services: {
+      name: string; image?: string; ports?: string[];
+      environment?: Record<string, string>; depends_on?: string[];
+    }[] = [];
+
+    let inServices = false;
+    let currentService: typeof services[0] | null = null;
+    let currentKey: string | null = null;
+
+    for (const line of lines) {
+      const trimmed = line.trimEnd();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+
+      const indent = line.length - line.trimStart().length;
+
+      // Top-level "services:" key
+      if (indent === 0 && /^services:\s*$/.test(trimmed)) {
+        inServices = true;
+        continue;
+      }
+      // Another top-level key ends services block
+      if (indent === 0 && /^\S+:/.test(trimmed) && !trimmed.startsWith("services:")) {
+        inServices = false;
+        if (currentService) services.push(currentService);
+        currentService = null;
+        continue;
+      }
+
+      if (!inServices) continue;
+
+      // Service name at 2-space indent
+      if (indent === 2 && /^\s{2}\S+:\s*$/.test(line)) {
+        if (currentService) services.push(currentService);
+        currentService = { name: trimmed.replace(":", "").trim() };
+        currentKey = null;
+        continue;
+      }
+
+      if (!currentService) continue;
+
+      // Property at 4-space indent
+      if (indent === 4) {
+        const propMatch = trimmed.match(/^(\w[\w-]*):\s*(.*)/);
+        if (propMatch) {
+          const [, key, value] = propMatch;
+          currentKey = key;
+          if (key === "image" && value) {
+            currentService.image = value.trim();
+          } else if (key === "ports") {
+            currentService.ports = [];
+          } else if (key === "environment") {
+            currentService.environment = {};
+          } else if (key === "depends_on") {
+            currentService.depends_on = [];
+          }
+          continue;
+        }
+      }
+
+      // List items at 6-space indent (under ports, depends_on, etc.)
+      if (indent >= 6 && trimmed.startsWith("- ")) {
+        const val = trimmed.slice(2).trim().replace(/['"]/g, "");
+        if (currentKey === "ports" && currentService.ports) {
+          currentService.ports.push(val);
+        } else if (currentKey === "depends_on" && currentService.depends_on) {
+          currentService.depends_on.push(val);
+        }
+        continue;
+      }
+
+      // Env vars at 6-space indent (key: value format under environment)
+      if (indent >= 6 && currentKey === "environment" && currentService.environment) {
+        const envMatch = trimmed.match(/^(\w+):\s*(.*)/);
+        if (envMatch) {
+          currentService.environment[envMatch[1]] = envMatch[2].replace(/['"]/g, "").trim();
+        }
+      }
+    }
+
+    if (currentService) services.push(currentService);
+    return services;
+  } catch {
+    return [];
+  }
+}
+
+function collectPortHints(
+  repoPath: string,
+  scripts: Record<string, string>
+): Record<string, number> {
+  const hints: Record<string, number> = {};
+
+  // Scan .env* files for port-like values
+  const envFiles = [".env.example", ".env.sample", ".env.template", ".env.development", ".env.local", ".env"];
+  for (const f of envFiles) {
+    const fullPath = join(repoPath, f);
+    if (!existsSync(fullPath)) continue;
+    try {
+      const content = readFileSync(fullPath, "utf-8");
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const match = trimmed.match(/^([A-Z_][A-Z0-9_]*)\s*=\s*(\d{4,5})\s*$/);
+        if (match) {
+          const [, varName, value] = match;
+          const port = parseInt(value, 10);
+          if (port >= 1024 && port <= 65535) {
+            hints[varName] = port;
+          }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Scan package.json scripts for --port, -p, -P flags
+  for (const [, cmd] of Object.entries(scripts)) {
+    const portFlags = cmd.match(/(?:--port|-p|-P)\s+(\d{4,5})/g);
+    if (portFlags) {
+      for (const flag of portFlags) {
+        const num = flag.match(/(\d+)/)?.[1];
+        if (num) {
+          const port = parseInt(num, 10);
+          if (port >= 1024 && port <= 65535) {
+            hints[`script_port`] = port;
+          }
+        }
+      }
+    }
+  }
+
+  // Check vite.config.* / next.config.* for port settings
+  const configFiles = ["vite.config.ts", "vite.config.js", "next.config.ts", "next.config.js", "next.config.mjs"];
+  for (const f of configFiles) {
+    const fullPath = join(repoPath, f);
+    if (!existsSync(fullPath)) continue;
+    try {
+      const content = readFileSync(fullPath, "utf-8");
+      const portMatch = content.match(/port\s*[:=]\s*(\d{4,5})/);
+      if (portMatch) {
+        const port = parseInt(portMatch[1], 10);
+        if (port >= 1024 && port <= 65535) {
+          hints[`${f.split(".")[0]}_port`] = port;
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  return hints;
+}
+
+function collectConnectionStrings(repoPath: string): Record<string, string> {
+  const strings: Record<string, string> = {};
+  const envFiles = [".env.example", ".env.template", ".env.sample", ".env.development"];
+  const connPatterns = /^(DATABASE_URL|REDIS_URL|MONGO_URI|MONGODB_URI|POSTGRES_\w+|MYSQL_\w+|REDIS_\w*URL)\s*=\s*(.+)/;
+
+  for (const f of envFiles) {
+    const fullPath = join(repoPath, f);
+    if (!existsSync(fullPath)) continue;
+    try {
+      const content = readFileSync(fullPath, "utf-8");
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const match = trimmed.match(connPatterns);
+        if (match) {
+          strings[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  return strings;
+}
+
+function extractPrismaProvider(repoPath: string): string | null {
+  const prismaPath = join(repoPath, "prisma", "schema.prisma");
+  if (!existsSync(prismaPath)) return null;
+  try {
+    const content = readFileSync(prismaPath, "utf-8");
+    const match = content.match(/provider\s*=\s*"(\w+)"/);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function extractSetupInstructions(existingDocs: string | null): string | null {
+  if (!existingDocs) return null;
+
+  const headerPattern = /^#{1,3}\s*(Setup|Getting Started|Installation|Development|Quick Start|How to Run)\b/im;
+  const match = existingDocs.match(headerPattern);
+  if (!match?.index) return null;
+
+  // Extract from the matched header to the next same-level-or-higher header or end
+  const startIdx = match.index;
+  const headerLevel = match[0].match(/^(#+)/)?.[1].length ?? 2;
+  const rest = existingDocs.slice(startIdx + match[0].length);
+
+  // Find next header of same or higher level
+  const nextHeaderPattern = new RegExp(`^#{1,${headerLevel}}\\s+\\S`, "m");
+  const nextMatch = rest.match(nextHeaderPattern);
+  const section = nextMatch?.index
+    ? rest.slice(0, nextMatch.index)
+    : rest;
+
+  const trimmed = section.trim();
+  return trimmed ? trimmed.slice(0, 1500) : null;
 }
 
 // ── Deep inspection functions ──────────────────────────────────────

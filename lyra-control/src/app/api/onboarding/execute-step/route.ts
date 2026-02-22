@@ -6,10 +6,10 @@ import {
   scaffoldFilesInternal,
   setupLyraTeamInternal,
   runValidationInternal,
-} from "@/app/onboarding/actions";
-import type { StepResult } from "@/app/onboarding/actions";
+} from "@/app/(dashboard)/onboarding/actions";
+import type { StepResult } from "@/app/(dashboard)/onboarding/actions";
 import { createBreakdownInJira, type WorkBreakdown } from "@/lib/work-breakdown";
-import { setupProjectChannel } from "@/lib/messaging/slack";
+import { setupProjectChannel, reinviteOwner } from "@/lib/messaging/slack";
 
 type StepDef = { name: string; run: () => Promise<StepResult> };
 
@@ -75,23 +75,56 @@ function buildStepDefs(
     {
       name: "Slack Channel",
       run: async (): Promise<StepResult> => {
-        const slackEnabled = await prisma.setting.findUnique({
-          where: { key: "slack_enabled" },
+        const slackSettings = await prisma.setting.findMany({
+          where: { key: { in: ["slack_enabled", "slack_bot_token", "slack_owner_user_id"] } },
         });
-        if (slackEnabled?.value !== "true") {
+        const settingsMap: Record<string, string> = {};
+        for (const s of slackSettings) settingsMap[s.key] = s.value;
+
+        if (settingsMap.slack_enabled !== "true") {
           return { success: true, logs: ["Slack not enabled — skipping channel creation"] };
         }
+        const logs: string[] = [];
         try {
+          // Auto-detect owner user ID if missing
+          if (!settingsMap.slack_owner_user_id && settingsMap.slack_bot_token) {
+            const authRes = await fetch("https://slack.com/api/auth.test", {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${settingsMap.slack_bot_token}`,
+                "Content-Type": "application/json",
+              },
+              signal: AbortSignal.timeout(10_000),
+            });
+            const authData = await authRes.json();
+            if (authData.ok && authData.user_id) {
+              await prisma.setting.upsert({
+                where: { key: "slack_owner_user_id" },
+                update: { value: authData.user_id },
+                create: { key: "slack_owner_user_id", value: authData.user_id },
+              });
+              logs.push(`Auto-detected slack_owner_user_id: ${authData.user_id}`);
+            } else {
+              logs.push("WARNING: slack_owner_user_id not configured — you won't be auto-invited to the channel. Set it in Settings > Channels or run the Slack test.");
+            }
+          }
+
           const channelId = await setupProjectChannel(project.id);
-          return {
-            success: true,
-            logs: [`Created Slack channel #lyra-${jiraKey.toLowerCase()} (${channelId})`],
-          };
+          logs.push(`Created Slack channel #lyra-${jiraKey.toLowerCase()} (${channelId})`);
+
+          // Retroactively invite owner if they weren't invited during channel creation
+          const ownerSetting = await prisma.setting.findUnique({ where: { key: "slack_owner_user_id" } });
+          if (ownerSetting?.value) {
+            const inviteResult = await reinviteOwner(channelId);
+            if (inviteResult.ok) {
+              logs.push(`Invited owner to channel`);
+            }
+          }
+
+          return { success: true, logs };
         } catch (e) {
-          return {
-            success: true,
-            logs: [`Slack channel creation failed (non-fatal): ${(e as Error).message}`],
-          };
+          logs.push(`Slack channel creation failed (non-fatal): ${(e as Error).message}`);
+          return { success: true, logs };
         }
       },
     },

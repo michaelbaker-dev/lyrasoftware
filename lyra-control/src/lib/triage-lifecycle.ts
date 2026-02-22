@@ -10,7 +10,7 @@ import {
   type QaResultEvent,
 } from "./lyra-events";
 
-async function resolveTriageEntries(ticketKey: string, projectId: string) {
+export async function resolveTriageEntries(ticketKey: string, projectId: string) {
   const updated = await prisma.triageLog.updateMany({
     where: {
       ticketKey,
@@ -30,7 +30,12 @@ async function resolveTriageEntries(ticketKey: string, projectId: string) {
   }
 }
 
+let registered = false;
+
 export function registerTriageLifecycle() {
+  if (registered) return;
+  registered = true;
+
   lyraEvents.on("gate:passed", (data: GateResultEvent) => {
     resolveTriageEntries(data.ticketKey, data.projectId).catch((e) =>
       console.error("[TriageLifecycle] Error resolving on gate:passed:", e)

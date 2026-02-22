@@ -4,6 +4,7 @@
  */
 
 import { chat, type ChatMessage } from "./openrouter";
+import { isClaudeCodeModel, chatViaClaude } from "./claude-code-chat";
 import { prisma } from "./db";
 import { lyraEvents } from "./lyra-events";
 import {
@@ -197,13 +198,18 @@ ${outputTail}
     },
   ];
 
-  const response = await chat(messages, model, {
-    projectId: input.projectId,
-    ticketKey: input.ticketKey,
-    category: "triage",
-  });
-
-  const content = response.choices[0]?.message?.content || "{}";
+  let content: string;
+  if (isClaudeCodeModel(model)) {
+    const result = await chatViaClaude(messages, model);
+    content = result.content || "{}";
+  } else {
+    const response = await chat(messages, model, {
+      projectId: input.projectId,
+      ticketKey: input.ticketKey,
+      category: "triage",
+    });
+    content = response.choices[0]?.message?.content || "{}";
+  }
 
   try {
     // Extract JSON from response (handle markdown code blocks)
@@ -285,17 +291,17 @@ export async function triageAndActOnFailure(input: TriageInput): Promise<Failure
 
         linkedBugKey = bugResult?.key || null;
 
-        // Link bug to original story
+        // Link bug to original story with "Relates" (not "Blocks") to avoid
+        // deadlocking the dispatcher — the bug is informational, not a gate.
         if (bugResult?.key) {
-          await linkIssues(bugResult.key, input.ticketKey, "Blocks").catch((e) =>
+          await linkIssues(bugResult.key, input.ticketKey, "Relates").catch((e) =>
             console.error(`[FailureAnalyzer] Failed to link ${bugResult.key} to ${input.ticketKey}:`, e)
           );
         }
 
-        // Transition original to Blocked
-        await transitionToStatus(input.ticketKey, "Blocked").catch(() =>
-          // Some Jira workflows don't have "Blocked" — try adding a comment instead
-          addComment(input.ticketKey, `Blocked: Bug ${bugResult?.key} created for underlying issue.`)
+        // Return original to To Do so the dispatcher can retry it
+        await transitionToStatus(input.ticketKey, "To Do").catch(() =>
+          addComment(input.ticketKey, `Bug ${bugResult?.key} created for underlying issue. Returning to To Do for retry.`)
         );
 
         actionTaken = `Created bug ${bugResult?.key || "?"}, linked to ${input.ticketKey}, original blocked`;
@@ -406,6 +412,184 @@ export async function triageAndActOnFailure(input: TriageInput): Promise<Failure
   });
 
   return analysis;
+}
+
+// ── Lyra Smart Retry — targeted prompt generation ─────────────────────
+
+export async function generateSmartRetryPrompt(input: {
+  projectId: string;
+  ticketKey: string;
+  ticketSummary: string;
+  ticketDescription?: string;
+  sessionOutput: string;
+  gateChecks: { name: string; passed: boolean; details: string }[];
+  gateReasoning: string;
+  acceptanceCriteria: string[];
+  worktreePath: string;
+  baseBranch: string;
+  assignedRole: string;
+  attemptCount: number;
+}): Promise<string | null> {
+  const { execFile } = await import("child_process");
+  const { promisify } = await import("util");
+  const exec = promisify(execFile);
+
+  // Gather git diff from the worktree (what the agent produced)
+  let gitDiff = "";
+  try {
+    const { stdout } = await exec("git", ["diff", `${input.baseBranch}..HEAD`], {
+      cwd: input.worktreePath,
+      maxBuffer: 100_000,
+    });
+    gitDiff = stdout.slice(0, 8000);
+  } catch {
+    gitDiff = "(no diff available)";
+  }
+
+  // Get file listing of the worktree
+  let fileListing = "";
+  try {
+    const { stdout } = await exec("find", [".", "-type", "f", "-not", "-path", "./.git/*", "-not", "-path", "./node_modules/*"], {
+      cwd: input.worktreePath,
+      maxBuffer: 50_000,
+    });
+    fileListing = stdout.slice(0, 3000);
+  } catch {
+    fileListing = "(file listing unavailable)";
+  }
+
+  // Get git log to see what commits exist
+  let gitLog = "";
+  try {
+    const { stdout } = await exec("git", ["log", `${input.baseBranch}..HEAD`, "--oneline"], {
+      cwd: input.worktreePath,
+    });
+    gitLog = stdout.trim() || "(no commits on branch)";
+  } catch {
+    gitLog = "(git log unavailable)";
+  }
+
+  // Load previous session outputs for context (last 2)
+  let previousSessions = "";
+  try {
+    const sessions = await prisma.session.findMany({
+      where: { ticketKey: input.ticketKey, projectId: input.projectId },
+      orderBy: { createdAt: "desc" },
+      take: 2,
+      select: { id: true, output: true, status: true, createdAt: true },
+    });
+    previousSessions = sessions
+      .map((s) => `Session ${s.id} (${s.status}, ${s.createdAt.toISOString()}):\n${(s.output || "").slice(-2000)}`)
+      .join("\n\n---\n\n");
+  } catch {
+    previousSessions = "(no previous sessions found)";
+  }
+
+  // Load Jira comments for PO instructions and triage notes
+  let jiraComments = "";
+  try {
+    const { getIssue } = await import("./jira");
+    const issue = await getIssue(input.ticketKey);
+    const comments = issue.fields?.comment?.comments || [];
+    jiraComments = comments
+      .slice(-5) // last 5 comments
+      .map((c: { body: unknown; author?: { displayName?: string } }) => {
+        const body = typeof c.body === "string" ? c.body : JSON.stringify(c.body).slice(0, 500);
+        return `${c.author?.displayName || "Unknown"}: ${body}`;
+      })
+      .join("\n\n");
+  } catch {
+    jiraComments = "(no comments available)";
+  }
+
+  // Build the quality gate results summary
+  const gateResults = input.gateChecks
+    .map((c) => `${c.passed ? "PASSED" : "FAILED"}: ${c.name} — ${c.details.slice(0, 300)}`)
+    .join("\n");
+
+  const acList = input.acceptanceCriteria.length > 0
+    ? input.acceptanceCriteria.map((ac, i) => `${i + 1}. ${ac}`).join("\n")
+    : "(no acceptance criteria defined)";
+
+  // Call Lyra's brain with a comprehensive prompt
+  const messages: ChatMessage[] = [
+    {
+      role: "system",
+      content: `You are Lyra, the AI Scrum Master and lead technical advisor. An agent just failed the quality gate for a ticket. Your job is to generate a COMPLETE, SELF-CONTAINED agent prompt that will fix the specific failures and get this ticket to pass the quality gate.
+
+You must be extremely specific and actionable. The agent receiving your prompt has NO other context — your prompt is all they get (plus the standard role preamble and project CLAUDE.md).
+
+Structure your response as a direct instruction prompt for the agent. Do NOT include any meta-commentary or explanation for the human — write ONLY the agent prompt.`,
+    },
+    {
+      role: "user",
+      content: `## Ticket: ${input.ticketKey}
+Summary: ${input.ticketSummary}
+${input.ticketDescription ? `Description: ${input.ticketDescription}` : ""}
+Role: ${input.assignedRole}
+Attempt: ${input.attemptCount + 1}
+
+## Acceptance Criteria
+${acList}
+
+## Quality Gate Results (from last attempt)
+${gateResults}
+Reasoning: ${input.gateReasoning}
+
+## Git State
+Commits on branch:
+${gitLog}
+
+Diff (what the agent produced):
+\`\`\`
+${gitDiff}
+\`\`\`
+
+## Files in Worktree
+\`\`\`
+${fileListing}
+\`\`\`
+
+## Previous Agent Output (what they claimed)
+${input.sessionOutput.slice(-4000)}
+
+## Jira Comments (includes PO instructions and triage notes)
+${jiraComments}
+
+## Previous Session History
+${previousSessions.slice(0, 3000)}
+
+---
+
+Generate the agent prompt. Be specific:
+- List exactly which files need to be created or modified
+- Show the exact verification commands (build, test, type-check) to run
+- Address each FAILED quality gate check explicitly with the fix
+- If files exist but aren't committed, tell the agent to git add and commit them
+- If the approach was wrong, explain the correct approach
+- Include the acceptance criteria with specific verification steps
+- Tell the agent to run git status and git diff --stat before finishing
+- Remind them that ALL work must be committed — the quality gate evaluates the git diff`,
+    },
+  ];
+
+  try {
+    const response = await chat(
+      messages,
+      "anthropic/claude-haiku-4-5-20251001",
+      { projectId: input.projectId, ticketKey: input.ticketKey, category: "smart_retry" }
+    );
+    const prompt = response.choices[0]?.message?.content;
+    if (prompt && prompt.length > 100) {
+      console.log(`[SmartRetry] Generated ${prompt.length}-char targeted prompt for ${input.ticketKey}`);
+      return prompt;
+    }
+    console.warn(`[SmartRetry] Generated prompt too short for ${input.ticketKey}, falling back to standard`);
+    return null;
+  } catch (e) {
+    console.error(`[SmartRetry] Failed to generate prompt for ${input.ticketKey}:`, e);
+    return null;
+  }
 }
 
 // ── Slack bug report triage ───────────────────────────────────────────

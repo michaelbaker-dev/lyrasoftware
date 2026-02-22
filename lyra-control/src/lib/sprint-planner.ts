@@ -44,7 +44,7 @@ export async function planSprint(data: {
   logs.push(`Found ${backlogIssues.length} backlog issues`);
 
   if (backlogIssues.length === 0) {
-    throw new Error("Backlog is empty — generate a work breakdown first");
+    throw new Error("Jira backlog is empty. Use 'Create Jira Tickets' to populate from your approved work breakdown.");
   }
 
   // Get story points field
@@ -84,13 +84,13 @@ export async function planSprint(data: {
   });
 
   // Ask AI to select stories
-  logs.push(`Asking AI to plan sprint (velocity target: ${project.velocityTarget} points)...`);
+  const aiModel = data.model || "openrouter/auto";
+  logs.push(`Asking AI to plan sprint (velocity target: ${project.velocityTarget} points, model: ${aiModel})...`);
 
-  const aiResponse = await chat(
-    [
-      {
-        role: "system",
-        content: `You are a scrum master planning a sprint. Select stories from the backlog to fill a sprint.
+  const sprintMessages: { role: "system" | "user"; content: string }[] = [
+    {
+      role: "system",
+      content: `You are a scrum master planning a sprint. Select stories from the backlog to fill a sprint.
 
 Rules:
 - Target velocity: ${project.velocityTarget} story points (do not exceed by more than 3 points)
@@ -103,10 +103,10 @@ Rules:
   "selectedKeys": ["KEY-1", "KEY-2", ...],
   "reasoning": "Brief explanation of selection rationale"
 }`,
-      },
-      {
-        role: "user",
-        content: `Sprint: ${data.sprintName}
+    },
+    {
+      role: "user",
+      content: `Sprint: ${data.sprintName}
 Goal: ${data.goal || "Complete highest priority work"}
 Velocity target: ${project.velocityTarget} points
 
@@ -117,12 +117,14 @@ ${storySummaries.map((s: { key: string; type: string; summary: string; points: n
   if (s.blocks.length > 0) line += ` [BLOCKS: ${s.blocks.join(", ")}]`;
   return line;
 }).join("\n")}`,
-      },
-    ],
-    data.model || "openrouter/auto",
+    },
+  ];
+
+  const aiResponse = await chat(
+    sprintMessages,
+    aiModel,
     { projectId: data.projectId, category: "sprint-planning" }
   );
-
   const rawContent = aiResponse.choices[0]?.message?.content || "";
   let jsonStr = rawContent.trim();
   const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -195,6 +197,19 @@ export async function startSprint(sprintId: string): Promise<{ logs: string[] }>
 
   const sprint = await prisma.sprint.findUnique({ where: { id: sprintId } });
   if (!sprint) throw new Error("Sprint not found");
+
+  // Safety net: if project has a saved teamConfig but no teams, apply it before starting
+  const project = await prisma.project.findUnique({ where: { id: sprint.projectId } });
+  if (project) {
+    const existingTeams = await prisma.team.findMany({ where: { projectId: sprint.projectId } });
+    if (existingTeams.length === 0 && project.teamConfig) {
+      logs.push("No teams found — applying saved team configuration from onboarding...");
+      const { applyConfig } = await import("./team-templates");
+      const config = JSON.parse(project.teamConfig);
+      const result = await applyConfig(sprint.projectId, config);
+      logs.push(...result.logs);
+    }
+  }
 
   // Pre-start gap analysis — block if critical gaps exist (no agents for required roles)
   const sprintIssues = await jira.getSprintIssues(sprint.jiraSprintId);
@@ -425,19 +440,15 @@ export async function updateSprintProgress(projectId: string): Promise<void> {
     }
   }
 
-  // If sprint has no story points, fall back to counting all project tickets
-  // worked on during this sprint period (1 ticket = 1 point)
+  // If sprint has no story points, fall back to counting sprint tickets
+  // (1 ticket = 1 point) — scoped to sprint only, not all project tickets
   if (plannedPoints === 0) {
-    const allTodo = await jira.searchIssues(
-      `project = ${project.jiraKey} AND status != "Done" ORDER BY rank ASC`
-    );
-    const allDone = await jira.searchIssues(
-      `project = ${project.jiraKey} AND status = "Done" ORDER BY rank ASC`
-    );
-    const doneCount = allDone.issues?.length || 0;
-    const totalCount = doneCount + (allTodo.issues?.length || 0);
-    plannedPoints = totalCount;
-    completedPoints = doneCount;
+    const issues = sprintIssues.issues || [];
+    plannedPoints = issues.length;
+    completedPoints = issues.filter(
+      (i: { fields?: { status?: { statusCategory?: { key?: string } } } }) =>
+        i.fields?.status?.statusCategory?.key === "done"
+    ).length;
   }
 
   await prisma.sprint.update({

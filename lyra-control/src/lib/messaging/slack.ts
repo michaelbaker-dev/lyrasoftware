@@ -21,6 +21,44 @@ async function getSlackConfig(): Promise<{ botToken: string; ownerUserId: string
 }
 
 /**
+ * Auto-detect the bot installer's user ID via auth.test and save it
+ * as slack_owner_user_id if not already set.
+ * Returns the user ID if detected/already set, null otherwise.
+ */
+async function autoDetectOwnerUserId(botToken: string): Promise<string | null> {
+  try {
+    const res = await fetch("https://slack.com/api/auth.test", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${botToken}`,
+        "Content-Type": "application/json",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.user_id) return null;
+
+    // Check if already set
+    const existing = await prisma.setting.findUnique({
+      where: { key: "slack_owner_user_id" },
+    });
+    if (existing?.value) return existing.value;
+
+    // Save auto-detected user ID
+    await prisma.setting.upsert({
+      where: { key: "slack_owner_user_id" },
+      update: { value: data.user_id },
+      create: { key: "slack_owner_user_id", value: data.user_id },
+    });
+    console.log(`[Slack] Auto-detected owner user ID: ${data.user_id}`);
+    return data.user_id;
+  } catch (e) {
+    console.warn("[Slack] Failed to auto-detect owner user ID:", e);
+    return null;
+  }
+}
+
+/**
  * Invite the workspace owner to a channel (if configured).
  * Silently ignores "already_in_channel" errors.
  */
@@ -357,6 +395,31 @@ export async function ensureGeneralChannel(): Promise<string> {
   return channelId;
 }
 
+/**
+ * Re-invite the owner to a specific channel.
+ * Auto-detects the owner user ID if not already configured.
+ */
+export async function reinviteOwner(channelId: string): Promise<{
+  ok: boolean;
+  message: string;
+}> {
+  const config = await getSlackConfig();
+  if (!config) {
+    return { ok: false, message: "Slack not configured" };
+  }
+
+  let userId = config.ownerUserId;
+  if (!userId) {
+    userId = await autoDetectOwnerUserId(config.botToken);
+  }
+  if (!userId) {
+    return { ok: false, message: "Could not determine owner user ID. Set it in Settings > Channels." };
+  }
+
+  await inviteOwner(config.botToken, channelId, userId);
+  return { ok: true, message: `Invited user ${userId} to channel` };
+}
+
 export async function testSlackConnection(): Promise<{
   ok: boolean;
   message: string;
@@ -382,6 +445,17 @@ export async function testSlackConnection(): Promise<{
       return { ok: false, message: `Slack auth failed: ${data.error}` };
     }
 
+    // Auto-detect and save owner user ID if not already set
+    let userIdNote = "";
+    if (data.user_id && !config.ownerUserId) {
+      await prisma.setting.upsert({
+        where: { key: "slack_owner_user_id" },
+        update: { value: data.user_id },
+        create: { key: "slack_owner_user_id", value: data.user_id },
+      });
+      userIdNote = ` | Auto-saved owner user ID: ${data.user_id}`;
+    }
+
     // Auto-create #lyra-general if it doesn't exist, then send test message
     try {
       const channelId = await ensureGeneralChannel();
@@ -391,12 +465,12 @@ export async function testSlackConnection(): Promise<{
       );
       return {
         ok: true,
-        message: `Connected to "${data.team}" + test message sent to #lyra-general`,
+        message: `Connected to "${data.team}" + test message sent to #lyra-general${userIdNote}`,
       };
     } catch (e) {
       return {
         ok: true,
-        message: `Connected to "${data.team}" but #lyra-general setup failed: ${(e as Error).message}`,
+        message: `Connected to "${data.team}" but #lyra-general setup failed: ${(e as Error).message}${userIdNote}`,
       };
     }
   } catch (e) {

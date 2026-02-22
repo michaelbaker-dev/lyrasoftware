@@ -271,7 +271,7 @@ export async function validateAcceptanceCriteria(
       },
       { role: "user", content: userMessage },
     ],
-    "openrouter/auto",
+    "anthropic/claude-haiku-4-5-20251001",
     { projectId, category: "qa" }
   );
 

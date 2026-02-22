@@ -18,6 +18,7 @@ import { updateSprintProgress } from "./sprint-planner";
 import { STORY_DOD } from "./dod";
 import { lyraEvents } from "./lyra-events";
 import { runQualityGate } from "./quality-gate";
+import { registerTriageLifecycle } from "./triage-lifecycle";
 import { getResolvedModel, resolveClaudeModel } from "./team-templates";
 import { decide } from "./lyra-brain";
 import { parseClaudeCodeOutput, trackUsage } from "./cost-tracker";
@@ -113,6 +114,9 @@ export async function start() {
 
   // Clear dedup set on restart so abandoned tickets are re-evaluated
   notifiedAbandoned.clear();
+
+  // Ensure triage lifecycle listeners are registered before any events can fire
+  registerTriageLifecycle();
 
   state.running = true;
   console.log("[Dispatcher] Started — polling every", state.pollInterval / 1000, "seconds");
@@ -247,7 +251,7 @@ async function pollAndDispatch() {
         continue;
       }
 
-      const sprintJql = `project = ${project.jiraKey} AND sprint = ${project.activeSprintId} AND status = "To Do" ORDER BY rank ASC`;
+      const sprintJql = `project = ${project.jiraKey} AND sprint = ${project.activeSprintId} AND status = "To Do" AND issuetype != Epic ORDER BY rank ASC`;
       const sprintResults = await searchIssues(sprintJql);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const tickets: Array<{ id: string; key: string; fields: Record<string, any> }> = sprintResults.issues || [];
@@ -801,9 +805,9 @@ async function handleAgentCompletion(
         body: gateResult.reasoning,
       });
 
-      // Run failure triage on quality gate failures (non-fatal)
+      // Run failure triage + Lyra smart retry on quality gate failures
       try {
-        const { triageAndActOnFailure } = await import("./failure-analyzer");
+        const { triageAndActOnFailure, generateSmartRetryPrompt } = await import("./failure-analyzer");
         const teams = await prisma.team.findMany({
           where: { projectId: ctx.projectId, enabled: true },
           select: { name: true },
@@ -814,6 +818,7 @@ async function handleAgentCompletion(
         const gateFailureCount = await prisma.qualityGateRun.count({
           where: { ticketKey: ctx.ticketKey, projectId: ctx.projectId, passed: false },
         });
+        const attemptCount = failedSessions + gateFailureCount;
 
         await triageAndActOnFailure({
           projectId: ctx.projectId,
@@ -825,10 +830,38 @@ async function handleAgentCompletion(
             .filter((c: { passed: boolean }) => !c.passed)
             .map((c: { name: string; passed: boolean; details: string }) => `FAILED: ${c.name} — ${c.details}`)
             .join("\n"),
-          attemptCount: failedSessions + gateFailureCount,
+          attemptCount,
           teamLabels: teams.map((t) => t.name),
           source: "quality_gate",
         });
+
+        // Lyra smart retry: generate targeted prompt and auto-retry if under max retries
+        if (attemptCount < state.maxRetries) {
+          const smartPrompt = await generateSmartRetryPrompt({
+            projectId: ctx.projectId,
+            ticketKey: ctx.ticketKey,
+            ticketSummary: ctx.summary,
+            sessionOutput: finalOutput,
+            gateChecks: gateResult.checks,
+            gateReasoning: gateResult.reasoning,
+            acceptanceCriteria: ctx.acceptanceCriteria,
+            worktreePath: ctx.worktreePath,
+            baseBranch: ctx.baseBranch,
+            assignedRole: ctx.assignedRole,
+            attemptCount,
+          });
+
+          if (smartPrompt) {
+            console.log(`[Dispatcher] Lyra smart retry for ${ctx.ticketKey} (attempt ${attemptCount + 1})`);
+            await addComment(ctx.ticketKey, `[LYRA] Smart retry initiated — Lyra analyzed the failure and generated targeted instructions for the next agent.`);
+            // Use setTimeout to avoid blocking the completion handler
+            setTimeout(() => {
+              retryTicket(ctx.ticketKey, ctx.projectId, smartPrompt).catch((e) =>
+                console.error(`[Dispatcher] Smart retry failed for ${ctx.ticketKey}:`, e)
+              );
+            }, 5000);
+          }
+        }
       } catch (e) {
         console.error(`[Dispatcher] Gate failure triage error (non-fatal) for ${ctx.ticketKey}:`, e);
       }
@@ -847,9 +880,9 @@ async function handleAgentCompletion(
     await addComment(ctx.ticketKey, `Agent exited with code ${exitCode}. Returning to To Do for retry.`);
     await transitionToStatus(ctx.ticketKey, "To Do");
 
-    // Run failure triage (non-fatal)
+    // Run failure triage + Lyra smart retry (non-fatal)
     try {
-      const { triageAndActOnFailure } = await import("./failure-analyzer");
+      const { triageAndActOnFailure, generateSmartRetryPrompt } = await import("./failure-analyzer");
 
       // Gather team labels for routing
       const teams = await prisma.team.findMany({
@@ -864,6 +897,7 @@ async function handleAgentCompletion(
       const gateFailures = await prisma.qualityGateRun.count({
         where: { ticketKey: ctx.ticketKey, projectId: ctx.projectId, passed: false },
       });
+      const attemptCount = failedSessions + gateFailures;
 
       await triageAndActOnFailure({
         projectId: ctx.projectId,
@@ -871,9 +905,36 @@ async function handleAgentCompletion(
         ticketSummary: ctx.summary,
         sessionId: ctx.session.id,
         sessionOutput: finalOutput,
-        attemptCount: failedSessions + gateFailures,
+        attemptCount,
         teamLabels: teams.map((t) => t.name),
       });
+
+      // Lyra smart retry for agent crashes too
+      if (attemptCount < state.maxRetries) {
+        const smartPrompt = await generateSmartRetryPrompt({
+          projectId: ctx.projectId,
+          ticketKey: ctx.ticketKey,
+          ticketSummary: ctx.summary,
+          sessionOutput: finalOutput,
+          gateChecks: [], // No gate checks — agent crashed before getting there
+          gateReasoning: `Agent exited with code ${exitCode}`,
+          acceptanceCriteria: ctx.acceptanceCriteria,
+          worktreePath: ctx.worktreePath,
+          baseBranch: ctx.baseBranch,
+          assignedRole: ctx.assignedRole,
+          attemptCount,
+        });
+
+        if (smartPrompt) {
+          console.log(`[Dispatcher] Lyra smart retry (agent crash) for ${ctx.ticketKey} (attempt ${attemptCount + 1})`);
+          await addComment(ctx.ticketKey, `[LYRA] Smart retry initiated after agent crash — Lyra generated targeted recovery instructions.`);
+          setTimeout(() => {
+            retryTicket(ctx.ticketKey, ctx.projectId, smartPrompt).catch((e) =>
+              console.error(`[Dispatcher] Smart retry failed for ${ctx.ticketKey}:`, e)
+            );
+          }, 5000);
+        }
+      }
     } catch (e) {
       console.error(`[Dispatcher] Failure triage error (non-fatal) for ${ctx.ticketKey}:`, e);
     }
@@ -944,9 +1005,22 @@ async function spawnAgent(
     await exec("git", ["fetch", "origin", baseBranch], {
       cwd: projectPath,
     }).catch(() => {});
+    await exec("git", ["fetch", "origin", branchName], {
+      cwd: projectPath,
+    }).catch(() => {});
 
-    // Create git worktree branching from the project's base branch
-    await exec("git", ["worktree", "add", worktreePath, "-b", branchName, baseBranch], {
+    // Check if remote branch has previous work — resume from it instead of starting fresh
+    let branchBase = baseBranch;
+    try {
+      await exec("git", ["rev-parse", "--verify", `origin/${branchName}`], { cwd: projectPath });
+      branchBase = `origin/${branchName}`;
+      console.log(`[Dispatcher] Resuming ${ticketKey} from existing remote branch ${branchName}`);
+    } catch {
+      // No remote branch — fresh start from baseBranch
+    }
+
+    // Create git worktree branching from base (or remote branch if resuming)
+    await exec("git", ["worktree", "add", worktreePath, "-b", branchName, branchBase], {
       cwd: projectPath,
     });
   } catch (error) {
@@ -1103,8 +1177,10 @@ This file helps the next session resume if this one is interrupted.
     ? `\n## Acceptance Criteria\n${acceptanceCriteria.map((c) => `- [ ] ${c}`).join("\n")}\n`
     : "";
 
-  // Build Definition of Done section
-  const dodSection = `\n## Definition of Done (MUST satisfy ALL before finishing)\n${STORY_DOD.map((d) => `- [ ] ${d}`).join("\n")}\n`;
+  // Build Definition of Done section (role-aware: architects skip test requirement for scaffolding)
+  const { getStoryDod } = await import("./dod");
+  const dodItems = getStoryDod(assignedRole);
+  const dodSection = `\n## Definition of Done (MUST satisfy ALL before finishing)\n${dodItems.map((d) => `- [ ] ${d}`).join("\n")}\n`;
 
   // Build codebase context from analysis
   let codebaseContext = "";
@@ -1146,7 +1222,9 @@ ${analysis.directoryOverview || "Not available"}
     ? `\n## Story Description\n${descriptionText}\n`
     : "";
 
-  const scopeGuardrail = `\n## Scope\nYou are working on ONLY this ticket: ${ticketKey}. Do NOT create project scaffolding (package.json, tsconfig.json, directory structures) unless this ticket specifically requires it. If a file you need doesn't exist and isn't part of your ticket, note it as a dependency.\n`;
+  const scopeGuardrail = assignedRole === "architect"
+    ? `\n## Scope\nYou are working on ONLY this ticket: ${ticketKey}. As an architect, creating scaffolding (package.json, tsconfig.json, directory structures, config files) IS expected when the ticket requires it. Focus on setting up a solid foundation.\n`
+    : `\n## Scope\nYou are working on ONLY this ticket: ${ticketKey}. Do NOT create project scaffolding (package.json, tsconfig.json, directory structures) unless this ticket specifically requires it. If a file you need doesn't exist and isn't part of your ticket, note it as a dependency.\n`;
 
   const prompt = promptOverride ?? `${teamPromptSection}${rolePrompt}${personalitySection}${codebaseContext}${progressContext}
 
@@ -1477,6 +1555,47 @@ export async function retryTicket(
 
   if (!latestSession) throw new Error("Failed to create session");
   return { sessionId: latestSession.id };
+}
+
+/** Get the active agent process for a ticket, if any. */
+export function getActiveAgent(ticketKey: string): {
+  ticketKey: string;
+  projectId: string;
+  sessionId: string;
+  startedAt: Date;
+  branch: string;
+} | undefined {
+  const agent = state.activeAgents.get(ticketKey);
+  if (!agent) return undefined;
+  return {
+    ticketKey: agent.ticketKey,
+    projectId: agent.projectId,
+    sessionId: agent.sessionId,
+    startedAt: agent.startedAt,
+    branch: agent.branch,
+  };
+}
+
+/** Kill a running agent for a ticket. Returns true if an agent was found and killed. */
+export function killAgent(ticketKey: string): boolean {
+  const agent = state.activeAgents.get(ticketKey);
+  if (!agent) return false;
+
+  if (agent.process) {
+    agent.process.kill("SIGTERM");
+    setTimeout(() => {
+      try {
+        agent.process?.kill("SIGKILL");
+      } catch {
+        // Already dead
+      }
+    }, 10_000);
+  } else if (agent.abortController) {
+    agent.abortController.abort();
+  }
+
+  state.activeAgents.delete(ticketKey);
+  return true;
 }
 
 export async function updateConfig(config: {

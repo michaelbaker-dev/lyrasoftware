@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { api } from "@/lib/api";
 
 /**
  * Client-side hook for listening to Server-Sent Events.
@@ -17,7 +18,7 @@ export function useSSE<T>(eventName: string): T | null {
       esRef.current.close();
     }
 
-    const es = new EventSource("/api/events");
+    const es = new EventSource(api("/api/events"));
     esRef.current = es;
 
     es.addEventListener(eventName, (event) => {

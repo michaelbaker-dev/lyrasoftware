@@ -39,6 +39,10 @@ async function checkBranchHasCommits(
   baseBranch: string
 ): Promise<GateCheck> {
   try {
+    // Fetch latest from remote so we can see pushed commits even if local
+    // worktree was re-created (retry scenario where local HEAD = base)
+    await exec("git", ["fetch", "origin"], { cwd: worktreePath }).catch(() => {});
+
     const { stdout } = await exec(
       "git",
       ["log", `${baseBranch}..HEAD`, "--oneline"],
@@ -162,7 +166,9 @@ async function checkAcceptanceCriteria(
     };
   }
 
-  // Get diff for AI validation
+  // Get diff for AI validation.
+  // Try local diff first; if empty (retry scenario where worktree was re-created),
+  // fall back to the remote tracking branch which may have the actual pushed commits.
   let diff = "";
   try {
     const { stdout } = await exec(
@@ -173,6 +179,31 @@ async function checkAcceptanceCriteria(
     diff = stdout;
   } catch {
     diff = "";
+  }
+
+  // Retry fallback: check remote tracking branch for the diff
+  if (!diff.trim()) {
+    try {
+      const { stdout: branchName } = await exec(
+        "git",
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        { cwd: worktreePath }
+      );
+      const remoteBranch = `origin/${branchName.trim()}`;
+      // Verify the remote branch exists
+      await exec("git", ["rev-parse", "--verify", remoteBranch], { cwd: worktreePath });
+      const { stdout: remoteDiff } = await exec(
+        "git",
+        ["diff", `${baseBranch}..${remoteBranch}`],
+        { cwd: worktreePath }
+      );
+      if (remoteDiff.trim()) {
+        diff = remoteDiff;
+        console.log(`[QualityGate] Local diff empty but found ${remoteDiff.length} bytes on remote branch`);
+      }
+    } catch {
+      // No remote branch or fetch failed — fall through
+    }
   }
 
   // When there are no code changes, provide a clear message instead of an error

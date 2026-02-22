@@ -80,8 +80,8 @@ beforeEach(() => {
 
 describe("runQualityGate — already-done path", () => {
   it("returns alreadyDone=true when zero commits, AC passes, and Lyra approves", async () => {
-    // git log returns empty (no commits), git diff returns empty
-    mockExecSequence([{ stdout: "" }, { stdout: "" }]);
+    // git fetch, git log (no commits), git diff (empty), rev-parse HEAD (branch name), rev-parse --verify (remote exists), git diff remote (empty)
+    mockExecSequence([{ stdout: "" }, { stdout: "" }, { stdout: "" }, { stdout: "feat/test\n" }, { stdout: "" }, { stdout: "" }]);
 
     mockedValidateAC.mockResolvedValue({
       passed: true,
@@ -111,7 +111,8 @@ describe("runQualityGate — already-done path", () => {
   });
 
   it("returns passed=false when zero commits, AC passes, but Lyra rejects", async () => {
-    mockExecSequence([{ stdout: "" }, { stdout: "" }]);
+    // git fetch, git log (no commits), git diff (empty), rev-parse HEAD, rev-parse --verify, git diff remote (empty)
+    mockExecSequence([{ stdout: "" }, { stdout: "" }, { stdout: "" }, { stdout: "feat/test\n" }, { stdout: "" }, { stdout: "" }]);
 
     mockedValidateAC.mockResolvedValue({
       passed: true,
@@ -137,7 +138,8 @@ describe("runQualityGate — already-done path", () => {
   });
 
   it("returns passed=false when zero commits and AC fails", async () => {
-    mockExecSequence([{ stdout: "" }, { stdout: "" }]);
+    // git fetch, git log (no commits), git diff (empty), rev-parse HEAD, rev-parse --verify, git diff remote (empty)
+    mockExecSequence([{ stdout: "" }, { stdout: "" }, { stdout: "" }, { stdout: "feat/test\n" }, { stdout: "" }, { stdout: "" }]);
 
     mockedValidateAC.mockResolvedValue({
       passed: false,
@@ -159,8 +161,9 @@ describe("runQualityGate — already-done path", () => {
 
 describe("runQualityGate — normal path with commits", () => {
   it("returns passed=true, alreadyDone=false when all checks pass", async () => {
-    // git log (commits), tsc, tests, git diff (for AC)
+    // git fetch, git log (commits), tsc, tests, git diff (for AC)
     mockExecSequence([
+      { stdout: "" },                               // git fetch origin
       { stdout: "abc1234 feat: add feature X\n" }, // git log — has commits
       { stdout: "" },                               // tsc --noEmit (success)
       { stdout: "all tests passed" },                // npm test

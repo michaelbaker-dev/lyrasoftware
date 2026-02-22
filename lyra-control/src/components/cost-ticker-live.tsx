@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { CostUpdateEvent } from "@/lib/lyra-events";
+import { api } from "@/lib/api";
 
 interface ModelBreakdown {
   name: string;
@@ -38,7 +39,7 @@ export default function CostTickerLive({
   projectIdRef.current = projectId;
 
   const connect = useCallback(() => {
-    const es = new EventSource("/api/events");
+    const es = new EventSource(api("/api/events"));
 
     es.addEventListener("cost:update", (event) => {
       try {

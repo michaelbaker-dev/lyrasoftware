@@ -12,6 +12,7 @@ import { startScheduler } from "./scheduler";
 import { triggerDispatch } from "./dispatcher";
 import { getTransitions, transitionIssue } from "./jira";
 import { registerTriageLifecycle } from "./triage-lifecycle";
+import { reconcileTriageEntries } from "./triage-reconciler";
 
 // Persist init state across Next.js HMR reloads
 const globalForInit = globalThis as unknown as {
@@ -90,6 +91,17 @@ async function doInit() {
           console.warn(`[Init] Could not transition ${ticketKey} back to To Do:`, e);
         }
       }
+    }
+
+    // Reconcile stale triage entries against actual state
+    try {
+      const triageResult = await reconcileTriageEntries();
+      const total = triageResult.resolved + triageResult.ambiguousResolved;
+      if (total > 0) {
+        console.log(`[Init] Reconciled ${total} stale triage entries`);
+      }
+    } catch (e) {
+      console.error("[Init] Triage reconciliation failed (non-fatal):", e);
     }
 
     const active = await prisma.project.findFirst({

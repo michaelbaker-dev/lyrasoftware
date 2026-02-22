@@ -6,6 +6,8 @@ import { launchApp, stopApp, getAppStatus } from "@/lib/process-manager";
 import { generateReleaseNotes } from "@/lib/release-notes-generator";
 import { lyraEvents } from "@/lib/lyra-events";
 import { analyzeCodebase, type CodebaseAnalysis, type AnalysisMode } from "@/lib/codebase-analyzer";
+import { createBreakdownInJira, type WorkBreakdown } from "@/lib/work-breakdown";
+import { moveIssuesToSprint } from "@/lib/jira";
 import { NextRequest } from "next/server";
 
 // In-memory cache for launch analysis (avoids DB column, TTL = 10 min)
@@ -118,7 +120,7 @@ export async function POST(request: Request) {
       }
 
       case "generate-launch": {
-        const { projectId, maxRetries = 3 } = body;
+        const { projectId, maxRetries = 3, model } = body;
         if (!projectId) {
           return Response.json({ error: "projectId is required" }, { status: 400 });
         }
@@ -134,7 +136,8 @@ export async function POST(request: Request) {
           projectId,
           project.path,
           analysis,
-          Math.min(Math.max(Number(maxRetries) || 3, 1), 10)
+          Math.min(Math.max(Number(maxRetries) || 3, 1), 10),
+          model || undefined
         );
 
         return Response.json({
@@ -346,17 +349,149 @@ export async function POST(request: Request) {
         return Response.json({ success: true, results });
       }
 
+      case "populate-backlog": {
+        const { projectId } = body;
+        if (!projectId) {
+          return Response.json({ error: "projectId is required" }, { status: 400 });
+        }
+        const project = await prisma.project.findUnique({ where: { id: projectId } });
+        if (!project) {
+          return Response.json({ error: "Project not found" }, { status: 404 });
+        }
+        if (project.breakdownStatus !== "approved") {
+          return Response.json(
+            { error: "No approved work breakdown found. Generate and approve a breakdown in onboarding first." },
+            { status: 400 }
+          );
+        }
+        if (!project.breakdownContent) {
+          return Response.json(
+            { error: "Breakdown content is missing despite approved status." },
+            { status: 400 }
+          );
+        }
+
+        const breakdown = JSON.parse(project.breakdownContent) as WorkBreakdown;
+        const result = await createBreakdownInJira(project.jiraKey, breakdown);
+
+        // Move newly created stories into the active sprint so the dispatcher picks them up
+        if (project.activeSprintId && result.createdKeys.length > 0) {
+          await moveIssuesToSprint(project.activeSprintId, result.createdKeys);
+          result.logs.push(`Moved ${result.createdKeys.length} stories to active sprint ${project.activeSprintId}`);
+        }
+
+        await prisma.auditLog.create({
+          data: {
+            projectId,
+            actor: "user",
+            action: "breakdown.populated_jira",
+            details: JSON.stringify({ created: result.created, movedToSprint: !!project.activeSprintId }),
+          },
+        });
+
+        return Response.json({ success: true, created: result.created, logs: result.logs });
+      }
+
       case "create-agent": {
         const { projectId, role } = body;
         if (!projectId || !role) {
           return Response.json({ error: "projectId and role are required" }, { status: 400 });
         }
-        const { createAgentForRole } = await import("@/app/projects/[id]/team-actions");
+        const { createAgentForRole } = await import("@/app/(dashboard)/projects/[id]/team-actions");
         const agentResult = await createAgentForRole(projectId, role);
         if (!agentResult.success) {
           return Response.json({ error: agentResult.error }, { status: 400 });
         }
         return Response.json({ success: true, agentName: agentResult.agentName });
+      }
+
+      case "force-resolve": {
+        const { projectId, ticketKey } = body;
+        if (!projectId || !ticketKey) {
+          return Response.json({ error: "projectId and ticketKey are required" }, { status: 400 });
+        }
+
+        const { killAgent, transitionToStatus } = await import("@/lib/dispatcher");
+
+        // Kill running agent if any
+        killAgent(ticketKey);
+
+        // Update any running sessions for this ticket
+        await prisma.session.updateMany({
+          where: { ticketKey, projectId, status: "running" },
+          data: { status: "failed", completedAt: new Date() },
+        });
+
+        // Set agents back to idle
+        await prisma.agent.updateMany({
+          where: { projectId, currentTicket: ticketKey, status: "running" },
+          data: { status: "idle", currentTicket: null, startedAt: null },
+        });
+
+        // Transition to Done in Jira
+        await transitionToStatus(ticketKey, "Done");
+
+        await prisma.auditLog.create({
+          data: {
+            projectId,
+            actor: "user",
+            action: "ticket.force_resolved",
+            details: JSON.stringify({ ticketKey }),
+          },
+        });
+
+        return Response.json({ success: true });
+      }
+
+      case "kill-agent": {
+        const { projectId, ticketKey } = body;
+        if (!projectId || !ticketKey) {
+          return Response.json({ error: "projectId and ticketKey are required" }, { status: 400 });
+        }
+
+        const { killAgent: killAgentFn, transitionToStatus: transitionFn } = await import("@/lib/dispatcher");
+
+        const killed = killAgentFn(ticketKey);
+        if (!killed) {
+          return Response.json({ error: "No running agent found for this ticket" }, { status: 404 });
+        }
+
+        // Update session to failed
+        await prisma.session.updateMany({
+          where: { ticketKey, projectId, status: "running" },
+          data: { status: "failed", completedAt: new Date() },
+        });
+
+        // Set agent back to idle
+        await prisma.agent.updateMany({
+          where: { projectId, currentTicket: ticketKey, status: "running" },
+          data: { status: "idle", currentTicket: null, startedAt: null },
+        });
+
+        // Transition back to To Do so dispatcher can retry
+        await transitionFn(ticketKey, "To Do");
+
+        await prisma.auditLog.create({
+          data: {
+            projectId,
+            actor: "user",
+            action: "agent.killed",
+            details: JSON.stringify({ ticketKey }),
+          },
+        });
+
+        return Response.json({ success: true });
+      }
+
+      case "retry-ticket": {
+        const { projectId, ticketKey } = body;
+        if (!projectId || !ticketKey) {
+          return Response.json({ error: "projectId and ticketKey are required" }, { status: 400 });
+        }
+
+        const { retryTicket: retryFn } = await import("@/lib/dispatcher");
+        const { sessionId } = await retryFn(ticketKey, projectId);
+        return Response.json({ success: true, sessionId });
       }
 
       case "refresh": {

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { api } from "@/lib/api";
 
 /**
  * SSE hook that accumulates events into an array (vs useSSE which replaces state).
@@ -21,7 +22,7 @@ export function useSSELog<T>(
       esRef.current.close();
     }
 
-    const es = new EventSource("/api/events");
+    const es = new EventSource(api("/api/events"));
     esRef.current = es;
 
     es.addEventListener(eventName, (event) => {

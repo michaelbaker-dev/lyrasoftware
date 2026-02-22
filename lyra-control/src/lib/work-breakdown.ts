@@ -8,6 +8,7 @@ import { prisma } from "./db";
 import * as jira from "./jira";
 import { trackUsage, estimateCloudCost } from "./cost-tracker";
 import { getAllRoles, buildRoleListForPrompt } from "./role-config";
+import { isClaudeCodeModel, chatViaClaude } from "./claude-code-chat";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -227,6 +228,33 @@ async function chatWithRouting(
 
     return data.choices?.[0]?.message?.content || "";
   }
+
+  // Claude Code CLI — route claude-code/* models through the CLI
+  if (isClaudeCodeModel(model)) {
+    const result = await chatViaClaude(messages, model);
+
+    // Track usage
+    try {
+      await trackUsage({
+        projectId: costContext?.projectId,
+        category: "breakdown",
+        provider: "claude-code",
+        requestedModel: model,
+        actualModel: result.cliModel,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        cost: 0, // Max subscription
+        durationMs: result.durationMs,
+        isLocal: false,
+      });
+    } catch (e) {
+      console.error("[WorkBreakdown] Cost tracking failed (non-fatal):", e);
+    }
+
+    return result.content;
+  }
+
   // OpenRouter — cost tracking is handled inside chat()
   const response = await chat(messages, model, {
     projectId: costContext?.projectId,
@@ -294,11 +322,22 @@ export async function generateWorkBreakdown(
     { projectId }
   );
 
-  // Parse JSON — handle possible markdown fences
+  // Parse JSON — handle markdown fences, leading/trailing prose, etc.
   let jsonStr = rawResponse.trim();
+
+  // 1. Try markdown code fences first
   const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenceMatch) {
     jsonStr = fenceMatch[1].trim();
+  }
+
+  // 2. If still not valid JSON, extract the outermost { ... } block
+  if (!jsonStr.startsWith("{") && !jsonStr.startsWith("[")) {
+    const firstBrace = jsonStr.indexOf("{");
+    const lastBrace = jsonStr.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
+    }
   }
 
   const breakdown = JSON.parse(jsonStr) as WorkBreakdown;
@@ -336,7 +375,7 @@ export async function generateWorkBreakdown(
 export async function createBreakdownInJira(
   projectKey: string,
   breakdown: WorkBreakdown
-): Promise<{ created: number; logs: string[] }> {
+): Promise<{ created: number; createdKeys: string[]; logs: string[] }> {
   const logs: string[] = [];
   let created = 0;
 
@@ -527,8 +566,9 @@ export async function createBreakdownInJira(
     }
   }
 
+  const createdKeys = [...storyMap.values()].map((s) => s.jiraKey);
   logs.push(`Total issues created: ${created}`);
-  return { created, logs };
+  return { created, createdKeys, logs };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
