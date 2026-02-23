@@ -128,6 +128,15 @@ function initTasks() {
     }
   });
 
+  // Session recovery — find completed sessions that never got a quality gate
+  // This handles server restarts during agent completion (close handler lost)
+  registerTask("session-recovery", 5 * 60_000, async () => {
+    const { recoverOrphanedSessions } = await import("./dispatcher");
+    await recoverOrphanedSessions().catch((e) =>
+      console.error("[Scheduler] Session recovery error:", e)
+    );
+  });
+
   // Sprint end check — every hour
   registerTask("sprint-end-check", 60 * 60_000, async () => {
     const { generateReleaseNotes } = await import("./release-notes-generator");

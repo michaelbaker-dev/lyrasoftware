@@ -104,13 +104,14 @@ model Session {
   ticketKey    String
   branch       String
   worktreePath String
-  status       String   @default("running") // running, completed, failed, cancelled
-  tokensUsed   Int      @default(0)
-  cost         Float    @default(0)
-  startedAt    DateTime @default(now())
-  completedAt  DateTime?
-  output       String?  // JSON log
-  prompt       String?  // The full prompt sent to the agent
+  status           String   @default("running") // running, completed, failed, cancelled
+  failureCategory  String?  // "infrastructure" | "agent_error" | "quality_gate" | "timeout"
+  tokensUsed       Int      @default(0)
+  cost             Float    @default(0)
+  startedAt        DateTime @default(now())
+  completedAt      DateTime?
+  output           String?  // JSON log
+  prompt           String?  // The full prompt sent to the agent
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

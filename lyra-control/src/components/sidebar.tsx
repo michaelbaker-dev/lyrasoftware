@@ -6,6 +6,7 @@ import { logoutAction } from "@/app/(auth)/actions";
 
 const navigation = [
   { name: "Dashboard", href: "/", icon: "⬡" },
+  { name: "Lyra", href: "/lyra", icon: "◈" },
   { name: "Onboarding", href: "/onboarding", icon: "+" },
   { name: "Projects", href: "/projects", icon: "▦" },
   { name: "Sprints", href: "/sprints", icon: "⟳" },

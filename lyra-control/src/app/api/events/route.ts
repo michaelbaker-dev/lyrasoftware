@@ -13,6 +13,9 @@ import {
   type AgentCompletedEvent,
   type AgentFailedEvent,
   type TicketAbandonedEvent,
+  type LyraDecisionEvent,
+  type NotifyEvent,
+  type LyraThinkingEvent,
 } from "@/lib/lyra-events";
 
 export async function GET() {
@@ -90,6 +93,15 @@ export async function GET() {
   const ticketAbandonedHandler = (data: TicketAbandonedEvent) => {
     try { send("ticket:abandoned", data); } catch { /* disconnected */ }
   };
+  const lyraDecisionHandler = (data: LyraDecisionEvent) => {
+    try { send("lyra:decision", data); } catch { /* disconnected */ }
+  };
+  const notifyHandler = (data: NotifyEvent) => {
+    try { send("notify", data); } catch { /* disconnected */ }
+  };
+  const thinkingHandler = (data: LyraThinkingEvent) => {
+    try { send("lyra:thinking", data); } catch { /* disconnected */ }
+  };
 
   lyraEvents.on("agent:output", agentOutputHandler);
   lyraEvents.on("app:output", appOutputHandler);
@@ -102,6 +114,9 @@ export async function GET() {
   lyraEvents.on("agent:completed", agentCompletedHandler);
   lyraEvents.on("agent:failed", agentFailedHandler);
   lyraEvents.on("ticket:abandoned", ticketAbandonedHandler);
+  lyraEvents.on("lyra:decision", lyraDecisionHandler);
+  lyraEvents.on("notify", notifyHandler);
+  lyraEvents.on("lyra:thinking", thinkingHandler);
 
   // Poll for updates every 5 seconds
   const interval = setInterval(() => {
@@ -122,6 +137,9 @@ export async function GET() {
       lyraEvents.off("agent:completed", agentCompletedHandler);
       lyraEvents.off("agent:failed", agentFailedHandler);
       lyraEvents.off("ticket:abandoned", ticketAbandonedHandler);
+      lyraEvents.off("lyra:decision", lyraDecisionHandler);
+      lyraEvents.off("notify", notifyHandler);
+      lyraEvents.off("lyra:thinking", thinkingHandler);
       close();
     }
   }, 5000);
@@ -141,6 +159,9 @@ export async function GET() {
     lyraEvents.off("agent:completed", agentCompletedHandler);
     lyraEvents.off("agent:failed", agentFailedHandler);
     lyraEvents.off("ticket:abandoned", ticketAbandonedHandler);
+    lyraEvents.off("lyra:decision", lyraDecisionHandler);
+    lyraEvents.off("notify", notifyHandler);
+    lyraEvents.off("lyra:thinking", thinkingHandler);
     close();
   }, 30 * 60 * 1000); // 30 min max connection
 

@@ -587,7 +587,7 @@ Generate the agent prompt. Be specific:
   try {
     const response = await chat(
       messages,
-      "anthropic/claude-haiku-4-5-20251001",
+      "anthropic/claude-haiku-4.5",
       { projectId: input.projectId, ticketKey: input.ticketKey, category: "smart_retry" }
     );
     const prompt = response.choices[0]?.message?.content;

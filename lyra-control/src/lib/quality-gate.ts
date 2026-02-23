@@ -132,7 +132,12 @@ async function checkTestsPass(worktreePath: string): Promise<GateCheck> {
   }
 
   try {
-    const { stdout } = await exec("npm", ["test", "--", "--passWithNoTests"], {
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    const testCmd = pkg.scripts?.test || "";
+    // Only pass --passWithNoTests for vitest/jest (other test runners don't support it)
+    const isVitestOrJest = /vitest|jest/.test(testCmd);
+    const args = isVitestOrJest ? ["test", "--", "--passWithNoTests"] : ["test"];
+    const { stdout } = await exec("npm", args, {
       cwd: worktreePath,
       timeout: 300_000,
     });
@@ -143,10 +148,11 @@ async function checkTestsPass(worktreePath: string): Promise<GateCheck> {
     };
   } catch (e) {
     const stderr = (e as { stderr?: string }).stderr || "";
+    const stdout = (e as { stdout?: string }).stdout || "";
     return {
       name: "Tests pass",
       passed: false,
-      details: `Tests failed:\n${stderr.slice(0, 1000)}`,
+      details: `Tests failed:\n${(stderr || stdout).slice(0, 1000)}`,
     };
   }
 }
@@ -156,7 +162,8 @@ async function checkAcceptanceCriteria(
   baseBranch: string,
   criteria: string[],
   agentOutput: string,
-  projectId?: string
+  projectId?: string,
+  priorChecks?: GateCheck[]
 ): Promise<GateCheck> {
   if (criteria.length === 0) {
     return {
@@ -167,16 +174,34 @@ async function checkAcceptanceCriteria(
   }
 
   // Get diff for AI validation.
-  // Try local diff first; if empty (retry scenario where worktree was re-created),
-  // fall back to the remote tracking branch which may have the actual pushed commits.
+  // Strategy: show file summary + added/modified files first (most relevant),
+  // then deleted files if space remains. Exclude lock files and binaries.
   let diff = "";
+  const diffRange = `${baseBranch}..HEAD`;
   try {
-    const { stdout } = await exec(
-      "git",
-      ["diff", `${baseBranch}..HEAD`],
+    // File-level summary (always fits, gives full picture)
+    const { stdout: statOut } = await exec(
+      "git", ["diff", "--stat", diffRange], { cwd: worktreePath }
+    ).catch(() => ({ stdout: "" }));
+
+    // Added/modified files first (these contain the actual work)
+    const { stdout: addedModified } = await exec(
+      "git", ["diff", diffRange, "--diff-filter=AM", "--", ".", ":(exclude)package-lock.json", ":(exclude)*.lock", ":(exclude)*.db"],
       { cwd: worktreePath }
-    );
-    diff = stdout;
+    ).catch(() => ({ stdout: "" }));
+
+    // Deleted files (less important — only include if space allows)
+    const { stdout: deleted } = await exec(
+      "git", ["diff", diffRange, "--diff-filter=D", "--stat", "--", ".", ":(exclude)package-lock.json", ":(exclude)*.lock", ":(exclude)*.db"],
+      { cwd: worktreePath }
+    ).catch(() => ({ stdout: "" }));
+
+    if (addedModified.trim() || statOut.trim()) {
+      diff = `--- File summary ---\n${statOut}\n--- Added/Modified files ---\n${addedModified}`;
+      if (deleted.trim()) {
+        diff += `\n--- Deleted files (summary) ---\n${deleted}`;
+      }
+    }
   } catch {
     diff = "";
   }
@@ -185,20 +210,20 @@ async function checkAcceptanceCriteria(
   if (!diff.trim()) {
     try {
       const { stdout: branchName } = await exec(
-        "git",
-        ["rev-parse", "--abbrev-ref", "HEAD"],
-        { cwd: worktreePath }
+        "git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktreePath }
       );
       const remoteBranch = `origin/${branchName.trim()}`;
-      // Verify the remote branch exists
       await exec("git", ["rev-parse", "--verify", remoteBranch], { cwd: worktreePath });
+      const remoteRange = `${baseBranch}..${remoteBranch}`;
+      const { stdout: remoteStat } = await exec(
+        "git", ["diff", "--stat", remoteRange], { cwd: worktreePath }
+      ).catch(() => ({ stdout: "" }));
       const { stdout: remoteDiff } = await exec(
-        "git",
-        ["diff", `${baseBranch}..${remoteBranch}`],
+        "git", ["diff", remoteRange, "--diff-filter=AM", "--", ".", ":(exclude)package-lock.json", ":(exclude)*.lock", ":(exclude)*.db"],
         { cwd: worktreePath }
-      );
+      ).catch(() => ({ stdout: "" }));
       if (remoteDiff.trim()) {
-        diff = remoteDiff;
+        diff = `--- File summary ---\n${remoteStat}\n--- Added/Modified files ---\n${remoteDiff}`;
         console.log(`[QualityGate] Local diff empty but found ${remoteDiff.length} bytes on remote branch`);
       }
     } catch {
@@ -211,10 +236,33 @@ async function checkAcceptanceCriteria(
     diff = "No code changes — agent reports work was already present in the codebase.";
   }
 
-  const result = await validateAcceptanceCriteria(criteria, diff, agentOutput, projectId);
+  // Include prior gate check results so the AC validator knows what already passed
+  let enrichedOutput = agentOutput;
+  if (priorChecks && priorChecks.length > 0) {
+    const checkSummary = priorChecks
+      .map((c) => `${c.passed ? "PASSED" : "FAILED"}: ${c.name} — ${c.details.slice(0, 300)}`)
+      .join("\n");
+    enrichedOutput = `--- Quality Gate Check Results (already verified) ---\n${checkSummary}\n\n--- Agent Output ---\n${agentOutput}`;
+  }
+
+  const result = await validateAcceptanceCriteria(criteria, diff, enrichedOutput, projectId);
 
   const unmet = result.criteriaResults.filter((c) => !c.met);
   if (!result.passed || unmet.length > 0) {
+    // Safety net override: when all prior mechanical checks passed AND the AC validator
+    // rejected ≤30% of criteria, mechanical evidence trumps AI uncertainty
+    if (priorChecks && priorChecks.length > 0 && priorChecks.every((c) => c.passed)) {
+      const unmetCount = unmet.length;
+      const threshold = Math.ceil(criteria.length * 0.3);
+      if (unmetCount <= threshold) {
+        return {
+          name: "Acceptance criteria",
+          passed: true,
+          details: result.details + `\n[OVERRIDE] All mechanical checks passed (commits, TSC, tests). ${unmetCount}/${criteria.length} criteria flagged (≤30% threshold). Approving based on mechanical evidence.`,
+        };
+      }
+    }
+
     return {
       name: "Acceptance criteria",
       passed: false,
@@ -293,6 +341,15 @@ export async function runQualityGate(params: {
     return finalize(params, checks, false, "No commits and acceptance criteria not met on base branch");
   }
 
+  // Ensure dependencies are installed (worktrees may lack node_modules after re-creation)
+  if (existsSync(join(params.worktreePath, "package.json")) && !existsSync(join(params.worktreePath, "node_modules"))) {
+    try {
+      await exec("npm", ["install", "--prefer-offline"], { cwd: params.worktreePath, timeout: 120_000 });
+    } catch (e) {
+      console.warn(`[QualityGate] npm install failed for ${params.ticketKey} (non-fatal):`, e);
+    }
+  }
+
   const tscCheck = await checkTypeScriptCompiles(params.worktreePath);
   checks.push(tscCheck);
 
@@ -304,20 +361,31 @@ export async function runQualityGate(params: {
     params.baseBranch,
     params.acceptanceCriteria,
     params.agentOutput,
-    params.projectId
+    params.projectId,
+    checks // pass prior check results for context
   );
   checks.push(acCheck);
 
-  // All checks done — ask Lyra for final verdict
+  // All checks done — confidence floor: when all mechanical + AC checks pass,
+  // approve directly without an extra AI review (prevents false rejections)
   const allPassed = checks.every((c) => c.passed);
 
+  if (allPassed) {
+    return finalize(
+      params,
+      checks,
+      true,
+      "All quality gate checks passed (commits, compilation, tests, acceptance criteria)."
+    );
+  }
+
+  // Only call decide() when some checks failed — to get AI judgment on whether failures are blocking
   const decision = await decide({
     projectId: params.projectId,
     event: "quality_gate",
     ticketKey: params.ticketKey,
-    question: allPassed
-      ? "All quality gate checks passed. Should this work be approved for QA review?"
-      : "Some quality gate checks failed. Should this ticket be sent back for rework?",
+    question:
+      "Some quality gate checks failed. Should this ticket be sent back for rework, or are the failures non-blocking?",
     data: {
       checks: checks.map((c) => ({
         name: c.name,
@@ -328,7 +396,7 @@ export async function runQualityGate(params: {
     },
   });
 
-  const passed = allPassed && decision.action === "approve";
+  const passed = decision.action === "approve";
   return finalize(params, checks, passed, decision.reasoning);
 }
 

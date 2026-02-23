@@ -10,6 +10,7 @@ import { getPersonalityTemplate, getContext } from "./lyra-brain";
 import { prisma } from "./db";
 import * as jira from "./jira";
 import { isTavilyConfigured, searchWeb, formatSearchResultsForPrompt } from "./tavily";
+import { getState } from "./dispatcher";
 
 // ── Token budget tiers ─────────────────────────────────────────────
 const TOKEN_BUDGET = {
@@ -315,12 +316,12 @@ export async function getRecentMessages(
 const GENERAL_CHAT_PROJECT_ID = "__general__";
 
 const GENERAL_TOKEN_BUDGET = {
-  system: 1_500,
+  system: 2_500,
   projects: 1_000,
   memories: 1_500,
-  conversation: 5_500,
+  conversation: 6_500,
   userMessage: 500,
-  total: 10_000,
+  total: 12_000,
 };
 
 // ── Action system prompt ──────────────────────────────────────────
@@ -356,6 +357,123 @@ CRITICAL rules for actions:
 - Use the project's jiraKey (from the project list above) for projectKey.
 - If you want to verify an action worked, include a follow-up [ACTION:get_issue issueKey="..."] — do NOT assume success.
 `;
+
+// ── Live system state for context enrichment ─────────────────────
+
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+export async function getSystemState(): Promise<string> {
+  const sections: string[] = [];
+
+  // Active agents from dispatcher
+  try {
+    const state = getState();
+    if (state.agents.length > 0) {
+      const lines = state.agents.slice(0, 5).map((a) => {
+        const elapsed = Math.floor((Date.now() - new Date(a.startedAt).getTime()) / 60000);
+        return `- ${a.ticketKey} (${elapsed}m, branch: ${a.branch})`;
+      });
+      sections.push(`Active agents (${state.activeAgentCount}):\n${lines.join("\n")}`);
+    } else {
+      sections.push("Active agents: none");
+    }
+  } catch {
+    sections.push("Active agents: unavailable");
+  }
+
+  // Stuck tickets: sessions grouped by ticketKey with 2+ failures
+  try {
+    const stuckSessions = await prisma.session.groupBy({
+      by: ["ticketKey"],
+      where: { status: "failed" },
+      _count: { ticketKey: true },
+      having: { ticketKey: { _count: { gte: 2 } } },
+      orderBy: { _count: { ticketKey: "desc" } },
+      take: 5,
+    });
+    if (stuckSessions.length > 0) {
+      const lines: string[] = [];
+      for (const s of stuckSessions) {
+        const lastSession = await prisma.session.findFirst({
+          where: { ticketKey: s.ticketKey, status: "failed" },
+          orderBy: { completedAt: "desc" },
+          select: { output: true },
+        });
+        const err = lastSession?.output
+          ? truncate(lastSession.output.slice(-200), 100)
+          : "no error recorded";
+        lines.push(`- ${s.ticketKey} (${s._count.ticketKey} failures): ${err}`);
+      }
+      sections.push(`Stuck tickets (2+ failures):\n${lines.join("\n")}`);
+    }
+  } catch {
+    // Defensive — skip if query fails
+  }
+
+  // Open triage items
+  try {
+    const openTriage = await prisma.triageLog.findMany({
+      where: { resolution: "open" },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+      select: { ticketKey: true, category: true, summary: true },
+    });
+    if (openTriage.length > 0) {
+      const lines = openTriage.map(
+        (t) => `- ${t.ticketKey} [${t.category}]: ${truncate(t.summary, 100)}`
+      );
+      sections.push(`Open triage items:\n${lines.join("\n")}`);
+    }
+  } catch {
+    // Defensive
+  }
+
+  // Recent quality gates
+  try {
+    const recentGates = await prisma.qualityGateRun.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 10,
+      select: { ticketKey: true, passed: true, reasoning: true },
+    });
+    if (recentGates.length > 0) {
+      const lines = recentGates.slice(0, 5).map(
+        (g) => `- ${g.ticketKey}: ${g.passed ? "PASSED" : "FAILED"} — ${truncate(g.reasoning, 100)}`
+      );
+      sections.push(`Recent gate results:\n${lines.join("\n")}`);
+    }
+  } catch {
+    // Defensive
+  }
+
+  // Phantom completions
+  try {
+    const phantoms = await prisma.auditLog.findMany({
+      where: { action: "agent.phantom_completion" },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+      select: { details: true, createdAt: true },
+    });
+    if (phantoms.length > 0) {
+      const lines = phantoms.map((p) => {
+        let detail = "";
+        try {
+          const d = JSON.parse(p.details);
+          detail = d.ticketKey || d.sessionId || "";
+        } catch {
+          detail = truncate(p.details, 80);
+        }
+        return `- ${detail} (${p.createdAt.toISOString().slice(0, 16)})`;
+      });
+      sections.push(`Phantom completions detected:\n${lines.join("\n")}`);
+    }
+  } catch {
+    // Defensive
+  }
+
+  return sections.join("\n\n");
+}
 
 // ── Build general chat context ────────────────────────────────────
 
@@ -405,6 +523,17 @@ async function buildGeneralChatContext(): Promise<OpenRouterMessage[]> {
 
   const systemPrompt = template({ allProjects, recentMemory });
 
+  // Enrich with live system state
+  let systemStateBlock = "";
+  try {
+    const stateText = await getSystemState();
+    if (stateText) {
+      systemStateBlock = `\n\n## Current System State (live data)\n${stateText}`;
+    }
+  } catch {
+    // Non-critical — skip if state fetch fails
+  }
+
   // Load general conversation window
   const chatMessages = await prisma.chatMessage.findMany({
     where: { projectId: null },
@@ -424,11 +553,13 @@ async function buildGeneralChatContext(): Promise<OpenRouterMessage[]> {
       content: [
         systemPrompt,
         "",
-        "You are chatting with Mike, the Product Owner, in #lyra-general on Slack.",
+        "You are chatting with Mike, the Product Owner, in the Lyra Center command page.",
         "You have full context on all active projects and can discuss any of them.",
         "You can brainstorm, answer questions, give status updates, help prioritize, and take actions in Jira.",
         "Be conversational and warm — this is a collaboration, not a status report.",
         "When referencing projects, use their Jira key (e.g., LYRA, PROJ).",
+        "When asked about stuck tickets, blockers, or failures, use the system state data below to give specific answers.",
+        systemStateBlock,
         ACTION_INSTRUCTIONS,
       ].join("\n"),
     },

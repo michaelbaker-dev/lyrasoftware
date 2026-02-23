@@ -90,7 +90,8 @@ export async function createIssue(
   projectKey: string,
   issueType: "Epic" | "Story" | "Bug" | "Task" | "Subtask",
   summary: string,
-  description?: string
+  description?: string,
+  parentKey?: string
 ) {
   return jiraFetch("/issue", {
     method: "POST",
@@ -99,6 +100,7 @@ export async function createIssue(
         project: { key: projectKey },
         issuetype: { name: issueType },
         summary,
+        ...(parentKey && { parent: { key: parentKey } }),
         ...(description && {
           description: {
             type: "doc",

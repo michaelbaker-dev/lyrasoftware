@@ -16,7 +16,7 @@ import { createPR, enableAutoMerge } from "./github";
 import { prisma } from "./db";
 import { updateSprintProgress } from "./sprint-planner";
 import { STORY_DOD } from "./dod";
-import { lyraEvents } from "./lyra-events";
+import { lyraEvents, think } from "./lyra-events";
 import { runQualityGate } from "./quality-gate";
 import { registerTriageLifecycle } from "./triage-lifecycle";
 import { getResolvedModel, resolveClaudeModel } from "./team-templates";
@@ -79,6 +79,166 @@ const notifiedAbandoned = new Set<string>();
 /** Clear a ticket from the notifiedAbandoned set so the dispatcher will re-evaluate it. */
 export function resetAbandonedTicket(ticketKey: string) {
   notifiedAbandoned.delete(ticketKey);
+}
+
+/**
+ * Recover orphaned sessions — completed sessions that never got a quality gate run.
+ * This happens when the server restarts during agent execution (close handler lost).
+ * Finds completed sessions from the last hour without a corresponding quality gate run
+ * and triggers the gate + PR creation flow.
+ */
+export async function recoverOrphanedSessions() {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+  // Find completed sessions from the last hour
+  const recentCompleted = await prisma.session.findMany({
+    where: {
+      status: "completed",
+      completedAt: { gte: oneHourAgo },
+    },
+    select: {
+      id: true,
+      ticketKey: true,
+      projectId: true,
+      worktreePath: true,
+      branch: true,
+      output: true,
+      prompt: true,
+    },
+  });
+
+  if (recentCompleted.length === 0) return;
+
+  // Find which ones already have a quality gate run
+  const sessionIds = recentCompleted.map((s) => s.id);
+  const existingGates = await prisma.qualityGateRun.findMany({
+    where: { sessionId: { in: sessionIds } },
+    select: { sessionId: true },
+  });
+  const gatedSessionIds = new Set(existingGates.map((g) => g.sessionId));
+
+  // Filter to sessions without a gate run
+  const orphaned = recentCompleted.filter((s) => !gatedSessionIds.has(s.id));
+
+  if (orphaned.length === 0) return;
+
+  console.log(`[Dispatcher] Recovering ${orphaned.length} orphaned session(s): ${orphaned.map((s) => s.ticketKey).join(", ")}`);
+
+  for (const session of orphaned) {
+    // Skip if worktree doesn't exist
+    const { existsSync } = await import("fs");
+    if (!existsSync(session.worktreePath)) {
+      console.warn(`[Dispatcher] Worktree missing for ${session.ticketKey}: ${session.worktreePath}`);
+      continue;
+    }
+
+    // Skip if there's an active agent for this ticket
+    if (state.activeAgents.has(session.ticketKey)) continue;
+
+    try {
+      // Get project info for acceptance criteria
+      const issue = await getIssue(session.ticketKey);
+      const summary = (issue?.fields?.summary as string) || session.ticketKey;
+      const description = (issue?.fields?.description as string) || "";
+      const acceptanceCriteria = description
+        .split("\n")
+        .filter((l: string) => l.match(/^[-*]\s/))
+        .map((l: string) => l.replace(/^[-*]\s+/, "").trim())
+        .filter(Boolean);
+
+      const baseBranch = "main";
+
+      console.log(`[Dispatcher] Running quality gate for orphaned session: ${session.ticketKey}`);
+      const { runQualityGate } = await import("./quality-gate");
+      const gateResult = await runQualityGate({
+        sessionId: session.id,
+        ticketKey: session.ticketKey,
+        projectId: session.projectId,
+        worktreePath: session.worktreePath,
+        baseBranch,
+        acceptanceCriteria,
+        agentOutput: session.output || "",
+        summary,
+      });
+
+      if (gateResult.passed) {
+        console.log(`[Dispatcher] Orphaned session ${session.ticketKey} PASSED quality gate`);
+
+        // Push, create PR, transition
+        try {
+          const branchName = session.branch;
+          await exec("git", ["push", "-u", "origin", branchName, "--force-with-lease"], {
+            cwd: session.worktreePath,
+          });
+
+          const project = await prisma.project.findUnique({ where: { id: session.projectId } });
+          const repoName = project?.githubRepo || "";
+          if (repoName) {
+            const prUrl = await createPR(
+              repoName,
+              `${session.ticketKey}: ${summary}`,
+              `## Summary\n\nImplements ${session.ticketKey}: ${summary}\n\nJira: https://mbakers.atlassian.net/browse/${session.ticketKey}`,
+              branchName,
+              baseBranch,
+              session.projectId
+            ).catch(() => null);
+            if (prUrl) {
+              await addComment(session.ticketKey, `PR created: ${prUrl}`).catch(() => {});
+            }
+          }
+
+          const transitioned = await transitionToStatus(session.ticketKey, "Code Review");
+          if (!transitioned) {
+            await transitionToStatus(session.ticketKey, "Done");
+          }
+        } catch (e) {
+          console.error(`[Dispatcher] Orphan recovery push/PR failed for ${session.ticketKey}:`, e);
+        }
+      } else {
+        console.log(`[Dispatcher] Orphaned session ${session.ticketKey} FAILED quality gate`);
+        await addComment(
+          session.ticketKey,
+          `Quality Gate — FAILED (recovered session)\n\n${gateResult.reasoning}`
+        ).catch(() => {});
+        await transitionToStatus(session.ticketKey, "To Do");
+      }
+    } catch (e) {
+      console.error(`[Dispatcher] Session recovery failed for ${session.ticketKey}:`, e);
+    }
+  }
+}
+
+/** Store a retry override in the database so it survives server restarts. */
+async function storeRetryOverride(ticketKey: string, projectId: string, promptOverride: string, extraRetries: number) {
+  await prisma.lyraMemory.create({
+    data: {
+      projectId,
+      category: "retry_override",
+      content: JSON.stringify({ ticketKey, promptOverride, extraRetries }),
+    },
+  });
+}
+
+/** Load a retry override from the database. Returns null if none exists. */
+async function loadRetryOverride(ticketKey: string): Promise<{ promptOverride: string; extraRetries: number } | null> {
+  const mem = await prisma.lyraMemory.findFirst({
+    where: { category: "retry_override", content: { contains: `"ticketKey":"${ticketKey}"` } },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!mem) return null;
+  try {
+    const data = JSON.parse(typeof mem.content === "string" ? mem.content : JSON.stringify(mem.content));
+    return { promptOverride: data.promptOverride, extraRetries: data.extraRetries };
+  } catch { return null; }
+}
+
+/** Consume (delete) a retry override after it's been used to spawn an agent. */
+async function consumeRetryOverride(ticketKey: string) {
+  const mem = await prisma.lyraMemory.findFirst({
+    where: { category: "retry_override", content: { contains: `"ticketKey":"${ticketKey}"` } },
+    orderBy: { createdAt: "desc" },
+  });
+  if (mem) await prisma.lyraMemory.delete({ where: { id: mem.id } });
 }
 
 export function getState(): Omit<DispatcherState, "timer" | "activeAgents" | "_polling"> & {
@@ -175,6 +335,13 @@ async function loadConfig() {
   }
 }
 
+// ── Settings helper ─────────────────────────────────────────────────
+
+async function getSettingFloat(key: string, defaultVal: number): Promise<number> {
+  const setting = await prisma.setting.findUnique({ where: { key } });
+  return setting ? (parseFloat(setting.value) || defaultVal) : defaultVal;
+}
+
 // ── Agent health monitor — kills stuck agents ──────────────────────
 
 const MAX_AGENT_RUNTIME_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -229,12 +396,14 @@ async function pollAndDispatch() {
   if (state._polling) return;
   state._polling = true;
 
+  think("dispatcher", "start", `Polling for work... (${state.activeAgents.size}/${state.maxConcurrent} agents active)`);
   console.log(`[Dispatcher] Polling… (${state.activeAgents.size}/${state.maxConcurrent} agents active)`);
 
   // Check agent health before polling for new work
   await monitorAgents();
 
   if (state.activeAgents.size >= state.maxConcurrent) {
+    think("dispatcher", "done", "At max concurrency, skipping poll");
     console.log("[Dispatcher] At max concurrency, skipping poll");
     state._polling = false;
     return;
@@ -256,11 +425,34 @@ async function pollAndDispatch() {
         continue;
       }
 
+      // Per-sprint cost cap — skip entire project if sprint budget exceeded
+      const sprintCostCap = await getSettingFloat("cost_cap_per_sprint", 100);
+      const sprintCostResult = await prisma.session.aggregate({
+        _sum: { cost: true },
+        where: {
+          projectId: project.id,
+          // Approximate current sprint by sessions since sprint start
+          createdAt: { gte: new Date(Date.now() - (project.sprintLength || 14) * 24 * 60 * 60 * 1000) },
+        },
+      });
+      const sprintSpend = sprintCostResult._sum.cost || 0;
+      if (sprintSpend >= sprintCostCap) {
+        console.warn(`[Dispatcher] ${project.jiraKey}: Sprint cost cap exceeded ($${sprintSpend.toFixed(2)} >= $${sprintCostCap})`);
+        lyraEvents.emit("notify", {
+          projectId: project.id,
+          severity: "critical",
+          title: `Sprint cost cap exceeded: ${project.jiraKey}`,
+          body: `Sprint spend $${sprintSpend.toFixed(2)} exceeds cap of $${sprintCostCap}. No new agents will be spawned.`,
+        });
+        continue;
+      }
+
       const sprintJql = `project = ${project.jiraKey} AND sprint = ${project.activeSprintId} AND status = "To Do" AND issuetype != Epic ORDER BY rank ASC`;
       const sprintResults = await searchIssues(sprintJql);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const tickets: Array<{ id: string; key: string; fields: Record<string, any> }> = sprintResults.issues || [];
 
+      think("dispatcher", "check", `${project.jiraKey}: found ${tickets.length} To Do tickets in sprint`, { projectId: project.id });
       console.log(`[Dispatcher] ${project.jiraKey}: found ${tickets.length} "To Do" ticket(s) in sprint ${project.activeSprintId}`);
 
       for (const ticket of tickets) {
@@ -286,18 +478,26 @@ async function pollAndDispatch() {
 
         // Check retry count — skip tickets that have failed too many times
         // Count both session failures AND quality gate failures
+        // Infrastructure failures (ENOENT, PATH issues) are exempt — they're not agent errors
         const failedSessions = await prisma.session.count({
-          where: { ticketKey: ticket.key, projectId: project.id, status: "failed" },
+          where: {
+            ticketKey: ticket.key,
+            projectId: project.id,
+            status: "failed",
+            failureCategory: { not: "infrastructure" },
+          },
         });
         const gateFailures = await prisma.qualityGateRun.count({
           where: { ticketKey: ticket.key, projectId: project.id, passed: false },
         });
         const failedAttempts = failedSessions + gateFailures;
-        if (failedAttempts >= state.maxRetries) {
+        const override = await loadRetryOverride(ticket.key);
+        const effectiveMaxRetries = state.maxRetries + (override?.extraRetries ?? 0);
+        if (failedAttempts >= effectiveMaxRetries) {
           if (!notifiedAbandoned.has(ticket.key)) {
             notifiedAbandoned.add(ticket.key);
             console.log(
-              `[Dispatcher] ${ticket.key} has failed ${failedAttempts} times (max ${state.maxRetries}), skipping`
+              `[Dispatcher] ${ticket.key} has failed ${failedAttempts} times (max ${effectiveMaxRetries}), skipping`
             );
             lyraEvents.emit("notify", {
               projectId: project.id,
@@ -316,6 +516,27 @@ async function pollAndDispatch() {
           continue;
         }
 
+        // Per-ticket cost cap — skip if this ticket has burned too much money
+        const ticketCostCap = await getSettingFloat("cost_cap_per_ticket", 15);
+        const ticketCostResult = await prisma.session.aggregate({
+          _sum: { cost: true },
+          where: { ticketKey: ticket.key, projectId: project.id },
+        });
+        const ticketSpend = ticketCostResult._sum.cost || 0;
+        if (ticketSpend >= ticketCostCap) {
+          if (!notifiedAbandoned.has(`cost:${ticket.key}`)) {
+            notifiedAbandoned.add(`cost:${ticket.key}`);
+            console.warn(`[Dispatcher] ${ticket.key}: Per-ticket cost cap exceeded ($${ticketSpend.toFixed(2)} >= $${ticketCostCap})`);
+            lyraEvents.emit("notify", {
+              projectId: project.id,
+              severity: "critical",
+              title: `Cost cap exceeded: ${ticket.key}`,
+              body: `Ticket spend $${ticketSpend.toFixed(2)} exceeds cap of $${ticketCostCap}. Requires manual intervention.`,
+            });
+          }
+          continue;
+        }
+
         // Route ticket to team
         const ticketLabels = (ticket.fields.labels || []) as string[];
         const ticketComponents = ((ticket.fields.components || []) as { name: string }[]).map(
@@ -327,6 +548,7 @@ async function pollAndDispatch() {
           summary: ticket.fields.summary,
         });
 
+        think("dispatcher", "acting", `Spawning agent for ${ticket.key}`, { projectId: project.id, ticketKey: ticket.key });
         await spawnAgent(
           ticket.key,
           project.jiraKey,
@@ -335,8 +557,11 @@ async function pollAndDispatch() {
           ticket.fields.summary,
           ticket.fields.description,
           (project as { baseBranch?: string }).baseBranch || "main",
-          routedTeam
+          routedTeam,
+          override?.promptOverride
         );
+        // Consume the override after spawning (one-shot)
+        if (override) await consumeRetryOverride(ticket.key);
       }
     }
   } catch (error) {
@@ -349,6 +574,7 @@ async function pollAndDispatch() {
       },
     });
   } finally {
+    think("dispatcher", "done", "Poll cycle complete");
     state._polling = false;
   }
 }
@@ -670,11 +896,27 @@ async function handleAgentCompletion(
 
   const status = exitCode === 0 ? "completed" : "failed";
 
-  // Update session with cost data
+  // Classify failure category for retry intelligence
+  let failureCategory: string | null = null;
+  if (status === "failed") {
+    const outputLower = finalOutput.toLowerCase();
+    if (outputLower.includes("enoent") || outputLower.includes("spawn") || outputLower.includes("not found") || outputLower.includes("command failed")) {
+      failureCategory = "infrastructure";
+    } else if (outputLower.includes("phantom completion") || outputLower.includes("no commits")) {
+      failureCategory = "agent_error";
+    } else if (outputLower.includes("timeout") || outputLower.includes("sigterm") || outputLower.includes("exceeded") && outputLower.includes("time")) {
+      failureCategory = "timeout";
+    } else {
+      failureCategory = "agent_error";
+    }
+  }
+
+  // Update session with cost data and failure classification
   await prisma.session.update({
     where: { id: ctx.session.id },
     data: {
       status,
+      failureCategory,
       completedAt: new Date(),
       output: finalOutput,
       cost: costData.cost,
@@ -727,17 +969,25 @@ async function handleAgentCompletion(
       exitCode,
     });
 
-    // Run quality gate
-    const gateResult = await runQualityGate({
-      sessionId: ctx.session.id,
-      ticketKey: ctx.ticketKey,
-      projectId: ctx.projectId,
-      worktreePath: ctx.worktreePath,
-      baseBranch: ctx.baseBranch,
-      acceptanceCriteria: ctx.acceptanceCriteria,
-      agentOutput: finalOutput,
-      summary: ctx.summary,
-    });
+    // Run quality gate (wrapped in try/catch to prevent silent crashes in close handler)
+    let gateResult: Awaited<ReturnType<typeof runQualityGate>>;
+    try {
+      gateResult = await runQualityGate({
+        sessionId: ctx.session.id,
+        ticketKey: ctx.ticketKey,
+        projectId: ctx.projectId,
+        worktreePath: ctx.worktreePath,
+        baseBranch: ctx.baseBranch,
+        acceptanceCriteria: ctx.acceptanceCriteria,
+        agentOutput: finalOutput,
+        summary: ctx.summary,
+      });
+    } catch (gateErr) {
+      console.error(`[Dispatcher] QUALITY GATE CRASHED for ${ctx.ticketKey}:`, gateErr);
+      await addComment(ctx.ticketKey, `Quality gate crashed: ${gateErr}. Returning to To Do for retry.`).catch(() => {});
+      await transitionToStatus(ctx.ticketKey, "To Do");
+      return;
+    }
 
     // "Already done" path — AC met with zero code changes, skip PR
     if (gateResult.passed && gateResult.alreadyDone) {
@@ -836,6 +1086,12 @@ async function handleAgentCompletion(
         await transitionToStatus(ctx.ticketKey, "Done");
       }
     } else {
+      // Gate failed — classify session as quality_gate failure
+      await prisma.session.update({
+        where: { id: ctx.session.id },
+        data: { failureCategory: "quality_gate" },
+      }).catch(() => {});
+
       // Gate failed — send back to To Do with failure explanation
       await addComment(
         ctx.ticketKey,
@@ -1018,6 +1274,41 @@ async function handleAgentCompletion(
   setTimeout(() => triggerDispatch(), 10000);
 }
 
+// ── Pre-flight Checks ─────────────────────────────────────────────────
+
+async function preflightChecks(
+  ticketKey: string,
+  worktreePath: string
+): Promise<{ ok: boolean; reason?: string }> {
+  // 1. Can we resolve the claude binary?
+  const claudePath = join(process.env.HOME || "", ".local", "bin", "claude");
+  if (!existsSync(claudePath)) {
+    try {
+      await exec("which", ["claude"]);
+    } catch {
+      return { ok: false, reason: "claude CLI not found in PATH or ~/.local/bin" };
+    }
+  }
+
+  // 2. Valid git repo?
+  try {
+    await exec("git", ["rev-parse", "--git-dir"], { cwd: worktreePath, timeout: 5000 });
+  } catch {
+    return { ok: false, reason: "Invalid git worktree" };
+  }
+
+  // 3. Install deps if package.json exists but node_modules missing
+  if (existsSync(join(worktreePath, "package.json")) && !existsSync(join(worktreePath, "node_modules"))) {
+    try {
+      await exec("npm", ["install", "--prefer-offline"], { cwd: worktreePath, timeout: 120_000 });
+    } catch {
+      return { ok: false, reason: "npm install failed" };
+    }
+  }
+
+  return { ok: true };
+}
+
 // ── Spawn Agent ───────────────────────────────────────────────────────
 
 async function spawnAgent(
@@ -1079,6 +1370,27 @@ async function spawnAgent(
     });
   } catch (error) {
     console.error(`[Dispatcher] Failed to create worktree for ${ticketKey}:`, error);
+    return;
+  }
+
+  // Pre-flight checks — validate environment before creating session/agent records
+  const preflight = await preflightChecks(ticketKey, worktreePath);
+  if (!preflight.ok) {
+    console.error(`[Dispatcher] Pre-flight failed for ${ticketKey}: ${preflight.reason}`);
+    await prisma.auditLog.create({
+      data: {
+        projectId,
+        action: "agent.preflight_failed",
+        actor: "dispatcher",
+        details: JSON.stringify({ ticketKey, reason: preflight.reason, worktreePath }),
+      },
+    });
+    lyraEvents.emit("notify", {
+      projectId,
+      severity: "warning",
+      title: `Pre-flight failed: ${ticketKey}`,
+      body: `${preflight.reason}. Agent was NOT spawned (does not count as a retry).`,
+    });
     return;
   }
 
@@ -1398,9 +1710,22 @@ function spawnClaudeCliAgent(
   resolvedModel: string,
   envOverrides?: Record<string, string>
 ) {
-  // Strip CLAUDECODE env var so spawned agents don't think they're nested sessions
+  // Strip Claude Code env vars so spawned agents don't think they're nested sessions
   const cleanEnv = { ...process.env };
   delete cleanEnv.CLAUDECODE;
+  delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+  // Strip any other Claude-specific vars that could trigger nesting detection
+  for (const key of Object.keys(cleanEnv)) {
+    if (key.startsWith("CLAUDE") && key !== "CLAUDE_API_KEY") {
+      delete cleanEnv[key];
+    }
+  }
+
+  // Ensure claude CLI is on PATH (launchd may have a minimal PATH)
+  const userLocalBin = join(process.env.HOME || "/Users/mbagent", ".local", "bin");
+  if (cleanEnv.PATH && !cleanEnv.PATH.includes(userLocalBin)) {
+    cleanEnv.PATH = `${userLocalBin}:${cleanEnv.PATH}`;
+  }
 
   // Inject env overrides (e.g. ANTHROPIC_BASE_URL for LM Studio local models)
   if (envOverrides) {
@@ -1467,8 +1792,9 @@ function spawnClaudeCliAgent(
     if (!outputTimer) outputTimer = setTimeout(flushOutput, 2000);
   });
 
-  // Handle completion
+  // Handle completion (try/catch to prevent unhandled promise rejection in event handler)
   child.on("close", async (code) => {
+    try {
     if (outputTimer) clearTimeout(outputTimer);
     flushOutput();
     const rawOutput = agentProcess.output.join("");
@@ -1483,6 +1809,9 @@ function spawnClaudeCliAgent(
       requestedModel: resolvedModel,
       actualModel: claudeModel,
     });
+    } catch (err) {
+      console.error(`[Dispatcher] UNHANDLED ERROR in close handler for ${ctx.ticketKey}:`, err);
+    }
   });
 }
 
@@ -1625,6 +1954,39 @@ export async function retryTicket(
 
   if (!latestSession) throw new Error("Failed to create session");
   return { sessionId: latestSession.id };
+}
+
+/** Reset an abandoned ticket, store a smart prompt override, and trigger dispatch. */
+export async function retryWithNewPlan(
+  ticketKey: string,
+  projectId: string,
+  promptOverride: string,
+  analysisReason: string
+): Promise<boolean> {
+  try {
+    // Clear abandoned state so dispatcher will re-evaluate
+    resetAbandonedTicket(ticketKey);
+
+    // Store override in DB with 3 extra retries beyond maxRetries (survives restarts)
+    await storeRetryOverride(ticketKey, projectId, promptOverride, 3);
+
+    // Add Jira comment with the analysis
+    await addComment(
+      ticketKey,
+      `[OVERSIGHT] Deadlock detected. Lyra analyzed previous failures and created a new plan:\n\n${analysisReason}\n\nRetrying with revised instructions.`
+    ).catch(() => {});
+
+    // Ensure ticket is in "To Do"
+    await transitionToStatus(ticketKey, "To Do").catch(() => {});
+
+    // Trigger dispatch to pick up the ticket
+    triggerDispatch();
+
+    return true;
+  } catch (e) {
+    console.error(`[Dispatcher] retryWithNewPlan failed for ${ticketKey}:`, e);
+    return false;
+  }
 }
 
 /** Get the active agent process for a ticket, if any. */

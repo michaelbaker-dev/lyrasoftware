@@ -138,6 +138,113 @@ export function parseClaudeCodeOutput(output: string): ParsedClaudeCodeCost {
   return result;
 }
 
+// ── Waste Metrics ─────────────────────────────────────────────────────
+
+export interface WasteMetrics {
+  totalSpend: number;
+  wastedSpend: number;
+  wasteRatio: number;
+  firstAttemptSuccessRate: number;
+  retrySuccessRate: number;
+  infrastructureFailures: number;
+  agentFailures: number;
+  gateFailures: number;
+  timeoutFailures: number;
+}
+
+/**
+ * Calculate waste metrics across sessions.
+ * "Wasted" spend = cost of sessions for tickets that required retries
+ * (all attempts except the final successful one count as waste).
+ */
+export async function getWasteMetrics(projectId?: string): Promise<WasteMetrics> {
+  const where = projectId ? { projectId } : {};
+
+  // Get all sessions grouped by ticket
+  const sessions = await prisma.session.findMany({
+    where,
+    select: {
+      ticketKey: true,
+      status: true,
+      cost: true,
+      failureCategory: true,
+      createdAt: true,
+    },
+    orderBy: { createdAt: "asc" },
+  });
+
+  // Group by ticket
+  const byTicket = new Map<string, typeof sessions>();
+  for (const s of sessions) {
+    const list = byTicket.get(s.ticketKey) || [];
+    list.push(s);
+    byTicket.set(s.ticketKey, list);
+  }
+
+  let totalSpend = 0;
+  let wastedSpend = 0;
+  let firstAttemptSuccesses = 0;
+  let retrySuccesses = 0;
+  let totalTickets = 0;
+  let infrastructureFailures = 0;
+  let agentFailures = 0;
+  let gateFailures = 0;
+  let timeoutFailures = 0;
+
+  for (const [, ticketSessions] of byTicket) {
+    totalTickets++;
+    let ticketTotal = 0;
+    let hasSuccess = false;
+    let successCost = 0;
+
+    for (const s of ticketSessions) {
+      ticketTotal += s.cost;
+
+      if (s.status === "completed") {
+        hasSuccess = true;
+        successCost = s.cost;
+      }
+
+      if (s.status === "failed") {
+        switch (s.failureCategory) {
+          case "infrastructure": infrastructureFailures++; break;
+          case "quality_gate": gateFailures++; break;
+          case "timeout": timeoutFailures++; break;
+          default: agentFailures++; break;
+        }
+      }
+    }
+
+    totalSpend += ticketTotal;
+
+    if (hasSuccess) {
+      // Waste = total cost minus the successful session's cost
+      wastedSpend += ticketTotal - successCost;
+
+      if (ticketSessions.length === 1) {
+        firstAttemptSuccesses++;
+      } else {
+        retrySuccesses++;
+      }
+    } else {
+      // No success yet — all spend is waste
+      wastedSpend += ticketTotal;
+    }
+  }
+
+  return {
+    totalSpend,
+    wastedSpend,
+    wasteRatio: totalSpend > 0 ? wastedSpend / totalSpend : 0,
+    firstAttemptSuccessRate: totalTickets > 0 ? firstAttemptSuccesses / totalTickets : 0,
+    retrySuccessRate: totalTickets > 0 ? retrySuccesses / totalTickets : 0,
+    infrastructureFailures,
+    agentFailures,
+    gateFailures,
+    timeoutFailures,
+  };
+}
+
 // ── Track Usage ───────────────────────────────────────────────────────
 
 export async function trackUsage(params: TrackUsageParams): Promise<void> {

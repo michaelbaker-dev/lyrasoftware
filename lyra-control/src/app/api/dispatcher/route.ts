@@ -26,6 +26,9 @@ export async function POST(request: Request) {
     case "trigger":
       triggerDispatch();
       return NextResponse.json({ status: "dispatch_triggered" });
+    case "oversight":
+      import("@/lib/lyra-oversight").then((m) => m.runOversightCheck());
+      return NextResponse.json({ status: "oversight_triggered" });
     case "config":
       updateConfig(config);
       return NextResponse.json({ status: "updated", config });

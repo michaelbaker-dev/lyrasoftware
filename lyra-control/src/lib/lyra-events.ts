@@ -170,6 +170,14 @@ export interface MergeProgressEvent {
   status: "merging" | "merged" | "conflict" | "error";
 }
 
+export interface LyraThinkingEvent {
+  source: "oversight" | "dispatcher" | "scheduler" | "brain" | "triage" | "gate";
+  phase: "start" | "check" | "evaluating" | "decided" | "acting" | "done";
+  message: string;
+  projectId?: string;
+  ticketKey?: string;
+}
+
 // ── Event map ───────────────────────────────────────────────────────
 
 export interface LyraEventMap {
@@ -195,6 +203,7 @@ export interface LyraEventMap {
   "launch:progress": LaunchProgressEvent;
   "merge:progress": MergeProgressEvent;
   "merge:complete": MergeProgressEvent;
+  "lyra:thinking": LyraThinkingEvent;
   notify: NotifyEvent;
 }
 
@@ -238,3 +247,13 @@ class LyraEventBus {
 
 // Singleton instance
 export const lyraEvents = new LyraEventBus();
+
+/** Convenience helper — emits a lyra:thinking event for live feed visibility. */
+export function think(
+  source: LyraThinkingEvent["source"],
+  phase: LyraThinkingEvent["phase"],
+  message: string,
+  opts?: { projectId?: string; ticketKey?: string }
+) {
+  lyraEvents.emit("lyra:thinking", { source, phase, message, ...opts });
+}
