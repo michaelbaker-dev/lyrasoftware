@@ -16,6 +16,7 @@ import { join } from "path";
 import { prisma } from "./db";
 import { lyraEvents } from "./lyra-events";
 import { decide, validateAcceptanceCriteria } from "./lyra-brain";
+import { checkBuildSucceeds } from "./project-health-check";
 
 const exec = promisify(execFile);
 
@@ -353,6 +354,15 @@ export async function runQualityGate(params: {
   const tscCheck = await checkTypeScriptCompiles(params.worktreePath);
   checks.push(tscCheck);
 
+  // Build check — catches Next.js build failures, missing env vars, server action
+  // wiring issues that tsc --noEmit alone misses
+  const buildCheck = await checkBuildSucceeds(params.worktreePath);
+  checks.push({
+    name: buildCheck.name,
+    passed: buildCheck.passed,
+    details: buildCheck.details,
+  });
+
   const testCheck = await checkTestsPass(params.worktreePath);
   checks.push(testCheck);
 
@@ -375,7 +385,7 @@ export async function runQualityGate(params: {
       params,
       checks,
       true,
-      "All quality gate checks passed (commits, compilation, tests, acceptance criteria)."
+      "All quality gate checks passed (commits, compilation, build, tests, acceptance criteria)."
     );
   }
 

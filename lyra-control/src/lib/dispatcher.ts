@@ -23,6 +23,7 @@ import { getResolvedModel, resolveClaudeModel } from "./team-templates";
 import { decide } from "./lyra-brain";
 import { parseClaudeCodeOutput, trackUsage } from "./cost-tracker";
 import { runOpenRouterAgent } from "./openrouter-agent";
+import { runHealthCheck } from "./project-health-check";
 
 const exec = promisify(execFile);
 
@@ -1278,7 +1279,9 @@ async function handleAgentCompletion(
 
 async function preflightChecks(
   ticketKey: string,
-  worktreePath: string
+  worktreePath: string,
+  projectId?: string,
+  projectPath?: string
 ): Promise<{ ok: boolean; reason?: string }> {
   // 1. Can we resolve the claude binary?
   const claudePath = join(process.env.HOME || "", ".local", "bin", "claude");
@@ -1303,6 +1306,24 @@ async function preflightChecks(
       await exec("npm", ["install", "--prefer-offline"], { cwd: worktreePath, timeout: 120_000 });
     } catch {
       return { ok: false, reason: "npm install failed" };
+    }
+  }
+
+  // 4. Project health check — auto-fix .env, tsconfig excludes, .gitignore
+  if (projectPath) {
+    try {
+      const health = await runHealthCheck({
+        projectId,
+        projectPath,
+        mode: "preflight",
+        autoFix: true,
+      });
+      if (!health.healthy) {
+        const failedChecks = health.errors.map((c) => c.name).join(", ");
+        return { ok: false, reason: `Health check failed: ${failedChecks}` };
+      }
+    } catch (e) {
+      console.warn(`[Dispatcher] Health check error for ${ticketKey} (non-fatal):`, e);
     }
   }
 
@@ -1374,7 +1395,7 @@ async function spawnAgent(
   }
 
   // Pre-flight checks — validate environment before creating session/agent records
-  const preflight = await preflightChecks(ticketKey, worktreePath);
+  const preflight = await preflightChecks(ticketKey, worktreePath, projectId, projectPath);
   if (!preflight.ok) {
     console.error(`[Dispatcher] Pre-flight failed for ${ticketKey}: ${preflight.reason}`);
     await prisma.auditLog.create({

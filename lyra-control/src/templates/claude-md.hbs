@@ -86,6 +86,13 @@
 - End-to-end tests pass
 - Documentation updated if applicable
 
+## Worktree Safety
+- This project uses git worktrees at `worktrees/` for parallel agent execution
+- When modifying `tsconfig.json`: ensure `"worktrees"` is in the `exclude` array
+- When modifying vitest/jest config: ensure `worktrees/` is in test exclusion patterns
+- When modifying `.gitignore`: ensure `worktrees/` is listed
+- NEVER commit files from inside a `worktrees/` directory
+
 ## Working Conventions
 - Read existing code before making changes
 - Run tests before committing

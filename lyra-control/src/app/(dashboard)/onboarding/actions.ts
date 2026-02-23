@@ -10,6 +10,7 @@ import { analyzeCodebase, type CodebaseAnalysis } from "@/lib/codebase-analyzer"
 import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { isClaudeCodeModel, chatViaClaude } from "@/lib/claude-code-chat";
+import { runHealthCheck } from "@/lib/project-health-check";
 
 export type StepResult = {
   success: boolean;
@@ -2033,7 +2034,23 @@ export async function executeOnboarding(jiraKey: string): Promise<ExecuteResult>
       return { success: false, steps, error: `Team setup failed: ${teamResult.error}` };
     }
 
-    // 5. Validation
+    // 5. Health Check (post-scaffold, auto-fix enabled)
+    const healthResult = await runHealthCheck({
+      projectId: project.id,
+      projectPath: project.path,
+      mode: "post-scaffold",
+      autoFix: true,
+    });
+    const healthLogs = healthResult.checks.map(
+      (c) => `${c.passed ? "PASS" : "FAIL"} ${c.name}: ${c.details}${c.autoFixed ? " (auto-fixed)" : ""}`
+    );
+    steps.push({
+      name: "Health Check",
+      status: healthResult.healthy ? "success" : "failed",
+      logs: healthLogs,
+    });
+
+    // 6. Validation
     const validationResult = await runValidationInternal({
       projectName: project.name,
       jiraKey,
