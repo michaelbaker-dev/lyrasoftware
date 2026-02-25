@@ -72,7 +72,9 @@ async function buildBreakdownSystemPrompt(): Promise<string> {
   return `You are the Architect agent for Lyra, an AI-driven development platform.
 Your job is to decompose an approved PRD and ARD into a structured work breakdown.
 
-Return a single JSON object (no markdown fences, no explanation) with this exact schema:
+CRITICAL: You MUST respond with ONLY a valid JSON object. No prose, no explanation, no markdown fences, no text before or after the JSON. Your entire response must be parseable by JSON.parse().
+
+Return a single JSON object with this exact schema:
 {
   "features": [
     {
@@ -193,7 +195,8 @@ async function chatWithRouting(
         model: localModelId,
         messages,
         temperature: 0.7,
-        max_tokens: 8192,
+        max_tokens: 16384,
+        response_format: { type: "json_object" },
       }),
       signal: AbortSignal.timeout(600_000),
     });
@@ -256,10 +259,18 @@ async function chatWithRouting(
   }
 
   // OpenRouter — cost tracking is handled inside chat()
-  const response = await chat(messages, model, {
-    projectId: costContext?.projectId,
-    category: "breakdown",
-  });
+  const response = await chat(
+    messages,
+    model,
+    {
+      projectId: costContext?.projectId,
+      category: "breakdown",
+    },
+    {
+      response_format: { type: "json_object" },
+      max_tokens: 16384,
+    }
+  );
   return response.choices[0]?.message?.content || "";
 }
 
@@ -293,6 +304,53 @@ function validateStoryStructure(story: StoryBreakdown, logs: string[]): void {
   }
 }
 
+/**
+ * Attempt to extract and parse JSON from a raw AI response.
+ * Returns { success, data, truncated, error }.
+ * `truncated` is true when the JSON appears cut off (missing closing braces).
+ */
+function tryParseBreakdownJson(raw: string): {
+  success: boolean;
+  data?: Record<string, unknown>;
+  truncated: boolean;
+  error?: string;
+} {
+  let jsonStr = raw.trim();
+
+  // Strip markdown fences
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) {
+    jsonStr = fenceMatch[1].trim();
+  } else {
+    // If no closing fence, strip opening fence only (truncated response)
+    const openFence = jsonStr.match(/```(?:json)?\s*([\s\S]*)/);
+    if (openFence && !jsonStr.includes("```", openFence.index! + 3 + (openFence[0].startsWith("```json") ? 4 : 0))) {
+      jsonStr = openFence[1].trim();
+    }
+  }
+
+  // Extract outermost { ... } block
+  if (!jsonStr.startsWith("{") && !jsonStr.startsWith("[")) {
+    const firstBrace = jsonStr.indexOf("{");
+    const lastBrace = jsonStr.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
+    } else if (firstBrace !== -1) {
+      jsonStr = jsonStr.slice(firstBrace); // No closing brace — likely truncated
+    }
+  }
+
+  try {
+    const data = JSON.parse(jsonStr) as Record<string, unknown>;
+    return { success: true, data, truncated: false };
+  } catch (e) {
+    const errMsg = (e as Error).message;
+    // "Unexpected end of JSON input" = truncation
+    const truncated = errMsg.includes("end of JSON") || errMsg.includes("Unexpected end");
+    return { success: false, truncated, error: errMsg };
+  }
+}
+
 export async function generateWorkBreakdown(
   prdContent: string,
   ardContent: string,
@@ -309,42 +367,99 @@ export async function generateWorkBreakdown(
     ardContent,
     codebaseContext ? `\n## Existing Codebase Analysis\n${codebaseContext}\n\nIMPORTANT: This is an existing codebase. Generate stories that build ON TOP of what already exists. Do not recreate existing functionality. Reference specific existing files and modules in story descriptions.` : "",
     feedback ? `\n## Feedback\n${feedback}\n\nPlease adjust the breakdown based on this feedback.` : "",
+    "",
+    'REMINDER: Respond with ONLY the JSON object. Start your response with { and end with }. No other text.',
   ].join("\n");
 
   const systemPrompt = await buildBreakdownSystemPrompt();
 
-  const rawResponse = await chatWithRouting(
-    [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    model,
-    { projectId }
-  );
+  const initialMessages: { role: "system" | "user" | "assistant"; content: string }[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ];
 
-  // Parse JSON — handle markdown fences, leading/trailing prose, etc.
-  let jsonStr = rawResponse.trim();
+  // Allow up to 2 continuation attempts if the JSON is truncated
+  let fullResponse = "";
+  const MAX_CONTINUATIONS = 2;
 
-  // 1. Try markdown code fences first
-  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenceMatch) {
-    jsonStr = fenceMatch[1].trim();
+  for (let attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
+    let rawChunk: string;
+
+    if (attempt === 0) {
+      rawChunk = await chatWithRouting(initialMessages, model, { projectId });
+    } else {
+      // Continuation: new single-turn call with the truncated output in the prompt
+      // Extract just the JSON portion so far
+      let partialJson = fullResponse.trim();
+      const openFence = partialJson.match(/```(?:json)?\s*/);
+      if (openFence) partialJson = partialJson.slice(openFence.index! + openFence[0].length);
+      if (!partialJson.startsWith("{")) {
+        const fb = partialJson.indexOf("{");
+        if (fb !== -1) partialJson = partialJson.slice(fb);
+      }
+
+      // Use the last ~4000 chars to give enough context without exceeding limits
+      const tail = partialJson.length > 4000 ? partialJson.slice(-4000) : partialJson;
+
+      rawChunk = await chatWithRouting(
+        [
+          { role: "system", content: "You are completing a truncated JSON response. Output ONLY the remaining JSON to complete the object. No markdown fences, no explanation. Continue exactly from where the previous output ended." },
+          { role: "user", content: `The following JSON was truncated. Output ONLY the remaining text needed to complete it. Continue from exactly where it stops:\n\n...${tail}` },
+        ],
+        model,
+        { projectId }
+      );
+    }
+
+    fullResponse += rawChunk;
+
+    // Try to parse the accumulated response
+    const parseResult = tryParseBreakdownJson(fullResponse);
+    if (parseResult.success) {
+      break; // Valid JSON — we're done
+    }
+
+    // If JSON is truncated (not a structural error), continue
+    if (attempt < MAX_CONTINUATIONS && parseResult.truncated) {
+      console.log(`[WorkBreakdown] JSON truncated (attempt ${attempt + 1}/${MAX_CONTINUATIONS}), requesting continuation... (response length: ${fullResponse.length})`);
+      continue;
+    }
+
+    // Not truncated, just bad JSON — fail
+    break;
   }
 
-  // 2. If still not valid JSON, extract the outermost { ... } block
-  if (!jsonStr.startsWith("{") && !jsonStr.startsWith("[")) {
-    const firstBrace = jsonStr.indexOf("{");
-    const lastBrace = jsonStr.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
+  const rawResponse = fullResponse;
+
+  // Final parse attempt
+  const finalParse = tryParseBreakdownJson(rawResponse);
+  if (!finalParse.success) {
+    console.error("[WorkBreakdown] JSON parse failed after continuations.");
+    console.error("[WorkBreakdown] Raw response length:", rawResponse.length);
+    console.error("[WorkBreakdown] Raw (first 500 chars):", rawResponse.slice(0, 500));
+    console.error("[WorkBreakdown] Raw (last 500 chars):", rawResponse.slice(-500));
+    // Show a helpful preview in the thrown error so the UI can display it
+    const preview = rawResponse.slice(0, 120).replace(/\n/g, " ");
+    throw new Error(`Invalid breakdown: AI returned non-JSON response. Preview: "${preview}..." — Try a different model (claude-code/sonnet or openrouter/auto).`);
+  }
+
+  let parsed = finalParse.data!;
+
+  // Handle Claude Code CLI envelope leaking through
+  if (typeof parsed.result === "string" && !parsed.features) {
+    const innerParse = tryParseBreakdownJson(parsed.result as string);
+    if (innerParse.success) {
+      parsed = innerParse.data!;
     }
   }
 
-  const breakdown = JSON.parse(jsonStr) as WorkBreakdown;
+  const breakdown = parsed as unknown as WorkBreakdown;
 
   // Validate structure
   if (!breakdown.features || !Array.isArray(breakdown.features)) {
-    throw new Error("Invalid breakdown: missing features array");
+    console.error("[WorkBreakdown] Parsed object keys:", Object.keys(parsed));
+    console.error("[WorkBreakdown] Raw response (first 2000 chars):", rawResponse.slice(0, 2000));
+    throw new Error("Invalid breakdown: missing features array. AI response keys: " + Object.keys(parsed).join(", "));
   }
 
   const validationLogs: string[] = [];

@@ -59,8 +59,10 @@ async function jiraFetch(path: string, options: RequestInit = {}) {
     throw new Error(`Jira API error ${response.status}: ${body}`);
   }
 
-  if (response.status === 204) return null;
-  return response.json();
+  if (response.status === 204 || response.status === 201) return null;
+  const text = await response.text();
+  if (!text) return null;
+  return JSON.parse(text);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -275,8 +277,10 @@ async function jiraAgileFetch(path: string, options: RequestInit = {}) {
     throw new Error(`Jira Agile API error ${response.status}: ${body}`);
   }
 
-  if (response.status === 204) return null;
-  return response.json();
+  if (response.status === 204 || response.status === 201) return null;
+  const text = await response.text();
+  if (!text) return null;
+  return JSON.parse(text);
 }
 
 export async function getBoardsForProject(projectKey: string) {

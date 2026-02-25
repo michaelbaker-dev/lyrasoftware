@@ -24,6 +24,7 @@ import { decide } from "./lyra-brain";
 import { parseClaudeCodeOutput, trackUsage } from "./cost-tracker";
 import { runOpenRouterAgent } from "./openrouter-agent";
 import { runHealthCheck } from "./project-health-check";
+import { CLAUDE_BIN } from "./claude-code-chat";
 
 const exec = promisify(execFile);
 
@@ -1754,7 +1755,7 @@ function spawnClaudeCliAgent(
   }
 
   const child = spawn(
-    "claude",
+    CLAUDE_BIN,
     ["-p", prompt, "--model", claudeModel, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"],
     {
       cwd: worktreePath,

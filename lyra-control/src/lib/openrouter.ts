@@ -77,6 +77,8 @@ export interface ChatCostContext {
 export interface ChatOptions {
   tools?: ToolDefinition[];
   tool_choice?: "auto" | "none";
+  response_format?: { type: "json_object" };
+  max_tokens?: number;
 }
 
 export async function chat(
@@ -149,6 +151,12 @@ export async function chat(
   if (options?.tools && options.tools.length > 0) {
     body.tools = options.tools;
     body.tool_choice = options.tool_choice ?? "auto";
+  }
+  if (options?.response_format) {
+    body.response_format = options.response_format;
+  }
+  if (options?.max_tokens) {
+    body.max_tokens = options.max_tokens;
   }
 
   const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {

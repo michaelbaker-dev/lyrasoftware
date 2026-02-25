@@ -5,7 +5,30 @@
  * Used by any module that needs to support `claude-code/*` model IDs.
  */
 
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
+import { existsSync } from "fs";
+import { join } from "path";
+
+/**
+ * Resolve the absolute path to the `claude` binary.
+ * Node child_process needs the full path because the Next.js server
+ * may not inherit the user's shell PATH (e.g. ~/.local/bin).
+ */
+function findClaudeBinary(): string {
+  // 1. Common install location
+  const localBin = join(process.env.HOME || "/Users/mbagent", ".local", "bin", "claude");
+  if (existsSync(localBin)) return localBin;
+
+  // 2. Try `which` as a fallback
+  try {
+    return execFileSync("which", ["claude"], { encoding: "utf-8" }).trim();
+  } catch {
+    // 3. Fall back to bare name — will ENOENT if not on PATH
+    return "claude";
+  }
+}
+
+export const CLAUDE_BIN = findClaudeBinary();
 
 /** Accepts any message shape that has role + content (compatible with openrouter ChatMessage) */
 export type ChatMessage = {
@@ -65,7 +88,8 @@ export async function chatViaClaude(
     const args = [
       "-p", "-",
       "--model", cliModel,
-      "--output-format", "json",
+      "--output-format", "stream-json",
+      "--verbose",
       "--max-turns", "1",
       "--dangerously-skip-permissions",
     ];
@@ -73,7 +97,7 @@ export async function chatViaClaude(
       args.push("--system-prompt", systemMsg.content);
     }
 
-    const child = spawn("claude", args, {
+    const child = spawn(CLAUDE_BIN, args, {
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -103,13 +127,54 @@ export async function chatViaClaude(
         reject(new Error(`Claude Code CLI error (exit ${code}): ${stderr.trim() || "unknown error"}`));
         return;
       }
-      // Parse JSON envelope from --output-format json
-      try {
-        const parsed = JSON.parse(stdout);
-        resolve(parsed.result || parsed.content || parsed.text || stdout.trim());
-      } catch {
-        resolve(stdout.trim());
+
+      // Parse stream-json output: one JSON object per line
+      // The "result" message at the end has the complete text.
+      // "assistant" messages are cumulative snapshots (not deltas).
+      let resultText = "";
+      let stopReason: string | null = null;
+      const lines = stdout.split("\n").filter(Boolean);
+
+      for (const line of lines) {
+        try {
+          const msg = JSON.parse(line);
+
+          // Final result message — always prefer this
+          if (msg.type === "result") {
+            resultText = msg.result ?? "";
+            stopReason = msg.stop_reason ?? null;
+            break;
+          }
+
+          // Track the latest assistant text snapshot (cumulative, not delta)
+          if (msg.type === "assistant" && msg.message?.content) {
+            let latestText = "";
+            for (const block of msg.message.content) {
+              if (block.type === "text") {
+                latestText += block.text;
+              }
+            }
+            if (latestText) resultText = latestText; // replace, not append
+            if (msg.message.stop_reason) stopReason = msg.message.stop_reason;
+          }
+        } catch {
+          // Skip non-JSON lines
+        }
       }
+
+      if (!resultText) {
+        console.error("[chatViaClaude] No text extracted from stream-json output.");
+        console.error("[chatViaClaude] Lines received:", lines.length);
+        if (lines.length > 0) {
+          console.error("[chatViaClaude] Last line:", lines[lines.length - 1].slice(0, 500));
+        }
+      }
+
+      if (stopReason === "max_tokens" || stopReason === "end_turn_max_tokens") {
+        console.warn("[chatViaClaude] Response was truncated (stop_reason:", stopReason, "). Length:", resultText.length);
+      }
+
+      resolve(resultText);
     });
   });
 
