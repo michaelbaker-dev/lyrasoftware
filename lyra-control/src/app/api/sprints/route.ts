@@ -389,6 +389,11 @@ export async function POST(request: Request) {
           },
         });
 
+        await prisma.project.update({
+          where: { id: projectId },
+          data: { breakdownStatus: "populated" },
+        });
+
         return Response.json({ success: true, created: result.created, logs: result.logs });
       }
 
